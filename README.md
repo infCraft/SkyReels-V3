@@ -5,17 +5,14 @@
 <h1 align="center">SkyReels V3: Multimodal Video Generation Model</h1> 
 
 <p align="center">
-👋 <a href="https://www.skyreels.ai/" target="_blank">Playground</a> · 🤗 <a href="https://huggingface.co/collections/Skywork/skyreels-v3" target="_blank">Hugging Face</a> · 🤖 <a href="https://www.modelscope.cn/collections/Skywork/SkyReels-V3" target="_blank">ModelScope</a> · 🌐 <a href="https://github.com/SkyworkAI/SkyReels-V3" target="_blank">GitHub</a>
-</p>
+👋 <a href="https://huggingface.co/spaces/Skywork/SkyReels-V3" target="_blank">Playground</a> . 🔧 <a href="https://www.apifree.ai/explore" target="_blank">API Platform</a> · 🤗 <a href="https://huggingface.co/collections/Skywork/skyreels-v3" target="_blank">Hugging Face</a> · 🤖 <a href="https://www.modelscope.cn/collections/Skywork/SkyReels-V3" target="_blank">ModelScope</a> · 📑 <a href="https://arxiv.org/abs/2601.17323">Technical Report</a>
 
 ---
 Welcome to the **SkyReels V3** repository! This is the official release of our flagship video generation model, built upon a unified **multimodal in-context learning framework**. SkyReels V3 natively supports three core generative capabilities: **1) multi-subject video generation from reference images**, **2) video generation guided by audio**, and **3) video-to-video generation**.
 
-We also provide API access to this model. You can integrate and use the SkyReels V3 series models through the **[SkyReels Developer Platform](https://platform.skyreels.ai/)**.
-
 ## 🔥🔥🔥 News!!
-* Jan 21, 2026: 🎉 We release the inference code and model weights of [SkyReels-V3](https://github.com/SkyworkAI/SkyReels-V3).
-* Dec 1, 2025: 🎉 We launched the API for the SkyReels-V3 models on the [SkyReels Developer Platform](https://platform.skyreels.ai/).
+* Jan 29, 2026: 🎉 We launched the API for the SkyReels-V3 models on the [apifree.ai](https://www.apifree.ai/explore).
+* Jan 29, 2026: 🎉 We release the inference code and model weights of [SkyReels-V3](https://github.com/SkyworkAI/SkyReels-V3).
 * Jun 1, 2025: 🎉 We published the technical report, [SkyReels-Audio: Omni Audio-Conditioned Talking Portraits in Video Diffusion Transformers](https://arxiv.org/pdf/2506.00830).
 * May 16, 2025: 🔥 We release the inference code for [video extension](#ve) and [start/end frame control](#se) in diffusion forcing model.
 * Apr 24, 2025: 🔥 We release the 720P models, [SkyReels-V2-DF-14B-720P](https://huggingface.co/Skywork/SkyReels-V2-DF-14B-720P) and [SkyReels-V2-I2V-14B-720P](https://huggingface.co/Skywork/SkyReels-V2-I2V-14B-720P). The former facilitates infinite-length autoregressive video generation, and the latter focuses on Image2Video synthesis.
