@@ -1,6 +1,4 @@
 wget==3.2
-torch==2.8.0
-torchvision==0.23.0
 opencv-python==4.11.0.86
 diffusers==0.34.0
 transformers==4.53.2
@@ -9,7 +7,7 @@ accelerate==1.8.1
 tqdm==4.67.1
 ftfy==6.3.1
 imageio-ffmpeg==0.5.1
-flash_attn==2.7.4.post1
+ninja
 numpy==1.26.4
 xfuser==0.4.3.post3
 yunchang==0.6.3.post1
@@ -19,4 +17,8 @@ librosa
 moviepy==2.2.1
 omegaconf==2.3.0
 kornia
+av
 torchao==0.10.0
+
+# pip install torch==2.8.0+cu128 torchvision==0.23.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+# pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3+cu11torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl

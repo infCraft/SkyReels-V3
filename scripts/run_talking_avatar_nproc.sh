@@ -1,6 +1,6 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-MODEL_PATH="/usr/models/audio2video/a2v_opensource"
+MODEL_PATH="/root/autodl-tmp/SkyReels-V3-A2V-19B"
 PROMPT="A young girl's eyes kept following the camera, singing with a mysterious expression. Surrounded by rich blooming florals, the camera cranes up slowly to reveal the full surreal, luxurious scene."
 INPUT_IMAGE="https://skyreels-api.oss-accelerate.aliyuncs.com/examples/talking_avatar_video/single1.png"
 INPUT_AUDIO="https://skyreels-api.oss-accelerate.aliyuncs.com/examples/talking_avatar_video/single_actor/huahai_5s.mp3"

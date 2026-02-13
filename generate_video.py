@@ -115,10 +115,10 @@ def prepare_and_broadcast_inputs(args, local_rank: int):
 
 
 MODEL_ID_CONFIG = {
-    "single_shot_extension": "Skywork/SkyReels-V3-Video-Extension",
-    "shot_switching_extension": "Skywork/SkyReels-V3-Video-Extension",
-    "reference_to_video": "Skywork/SkyReels-V3-Reference2Video",
-    "talking_avatar": "Skywork/SkyReels-V3-TalkingAvatar",
+    "single_shot_extension": "Skywork/SkyReels-V3-V2V-14B",
+    "shot_switching_extension": "Skywork/SkyReels-V3-V2V-14B",
+    "reference_to_video": "Skywork/SkyReels-V3-R2V-14B",
+    "talking_avatar": "Skywork/SkyReels-V3-A2V-19B",
 }
 
 if __name__ == "__main__":
@@ -143,7 +143,7 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Model path or HuggingFace model ID. If not specified, will auto-select based on task_type. "
-        "Supports: Skywork/SkyReels-V3-Reference2Video, Skywork/SkyReels-V3-Video-Extension, Skywork/SkyReels-V3-TalkingAvatar",
+        "Supports: Skywork/SkyReels-V3-R2V-14B, Skywork/SkyReels-V3-V2V-14B, Skywork/SkyReels-V3-A2V-19B",
     )
 
     # ==================== Generation Parameters ====================

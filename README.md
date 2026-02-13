@@ -56,8 +56,20 @@ The demos above showcase videos generated using our SkyReels-V3 unified multimod
 git clone https://github.com/SkyworkAI/SkyReels-V3
 cd SkyReels-V3
 
+# create a conda environment
+conda create -n sky python=3.12 -y
+conda activate sky
+conda install ffmpeg -y
+
 # Install dependencies (Recommended: Python 3.12+, CUDA 12.8+)
+# first install pytorch
+pip install torch==2.8.0+cu128 torchvision==0.23.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+
+# then install other dependencies
 pip install -r requirements.txt
+
+# finally, install flash_attn
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 ```
 
 ### 📥 Model Download
@@ -174,7 +186,7 @@ During the training phase, the SkyReels team introduced an image-video hybrid tr
 
 #### 📊 Performance Comparison
 
-| Model | Reference Consistency ↑ | Instruction Following ↑ | Visual Quality ↑ |
+| Model | Reference Consistency ⬆ | Instruction Following ⬇ | Visual Quality ⬆ |
 |-------|-------------------------|-------------------------|------------------|
 | Vidu Q2 | 0.5961 | 27.84 | 0.7877 |
 | Kling 1.6 | 0.6630 | 29.23 | 0.8034 |

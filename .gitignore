@@ -158,7 +158,8 @@ result/
 *.wav
 *.png
 *.mp3
-
+input_image/
+input_audio/
 
 video_extension_model
 reference_model
