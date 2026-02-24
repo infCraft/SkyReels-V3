@@ -920,8 +920,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 # ---- D2H Offload ----
                 profiler.evt_start(f"DiT Block {_blk_idx} > D2H Offload")
                 block.to("cpu")
-                torch.cuda.empty_cache()
                 profiler.evt_end(f"DiT Block {_blk_idx} > D2H Offload")
+                torch.cuda.empty_cache()
             profiler.evt_end("DiT Forward > Blocks (block_offload)")
 
             # head
@@ -929,8 +929,8 @@ class WanModel(ModelMixin, ConfigMixin):
             self.head.to("cuda")
             x = self.head(x, e)
             self.head.to("cpu")
-            torch.cuda.empty_cache()
             profiler.evt_end("DiT Forward > Head")
+            torch.cuda.empty_cache()
         else:
             profiler.evt_start("DiT Forward > Blocks (on-device)")
             for _blk_idx, block in enumerate(self.blocks):

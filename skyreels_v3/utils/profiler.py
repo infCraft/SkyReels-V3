@@ -31,9 +31,12 @@ Usage::
     profiler.summary()          # single sync, then print everything
 """
 
+import io
+import os
 import re
 import time
 from collections import OrderedDict, defaultdict
+from datetime import datetime
 
 import torch
 
@@ -102,68 +105,82 @@ class InferenceProfiler:
     # ================================================================== #
     #  Summary
     # ================================================================== #
-    def summary(self):
-        """Single synchronize, then print every recorded timing."""
+    def summary(self, log_dir: str = "logs"):
+        """Single synchronize, then print every recorded timing and save to log file."""
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
         resolved = self._resolve_events()
 
+        buf = io.StringIO()
         sep = "=" * 100
         dash = "-"
 
+        def _p(line: str = ""):
+            """Print to stdout and capture in buffer."""
+            print(line)
+            buf.write(line + "\n")
+
         # ---- Section 1: Wall-clock timings ----
-        print(f"\n{sep}")
-        print("  INFERENCE PROFILING SUMMARY")
-        print(sep)
+        _p(f"\n{sep}")
+        _p("  INFERENCE PROFILING SUMMARY")
+        _p(sep)
 
         if self.wall_timings:
-            print(f"\n  [Wall-clock timings  (torch.cuda.synchronize at boundaries)]")
-            print(f"  {'Module / Region':<60s} {'Total(s)':>9s}  {'Calls':>5s}  {'Avg(s)':>9s}")
-            print(f"  {dash*60} {dash*9}  {dash*5}  {dash*9}")
+            _p(f"\n  [Wall-clock timings  (torch.cuda.synchronize at boundaries)]")
+            _p(f"  {'Module / Region':<60s} {'Total(s)':>9s}  {'Calls':>5s}  {'Avg(s)':>9s}")
+            _p(f"  {dash*60} {dash*9}  {dash*5}  {dash*9}")
             for name, times in self.wall_timings.items():
                 total = sum(times)
                 count = len(times)
                 avg = total / count
-                print(f"  {name:<60s} {total:>9.3f}  {count:>5d}  {avg:>9.3f}")
+                _p(f"  {name:<60s} {total:>9.3f}  {count:>5d}  {avg:>9.3f}")
 
         # ---- Section 2: CUDA-event timings (individual) ----
         if resolved:
-            print(f"\n  [CUDA-Event timings  (non-blocking, zero pipeline stall)]")
-            print(f"  {'Module / Region':<60s} {'Total(s)':>9s}  {'Calls':>5s}  {'Avg(s)':>9s}")
-            print(f"  {dash*60} {dash*9}  {dash*5}  {dash*9}")
+            _p(f"\n  [CUDA-Event timings  (non-blocking, zero pipeline stall)]")
+            _p(f"  {'Module / Region':<60s} {'Total(s)':>9s}  {'Calls':>5s}  {'Avg(s)':>9s}")
+            _p(f"  {dash*60} {dash*9}  {dash*5}  {dash*9}")
             for name, times in resolved.items():
                 total = sum(times)
                 count = len(times)
                 avg = total / count
-                print(f"  {name:<60s} {total:>9.3f}  {count:>5d}  {avg:>9.3f}")
+                _p(f"  {name:<60s} {total:>9.3f}  {count:>5d}  {avg:>9.3f}")
 
         # ---- Section 3: Aggregated DiT block offload breakdown ----
         # Auto-detect pattern  "DiT Block \d+ > (H2D Load|Compute|D2H Offload)"
         agg = self._aggregate_dit_blocks(resolved)
         if agg:
-            print(f"\n  [DiT Block Offload Breakdown  (aggregated across all blocks & calls)]")
-            print(f"  {'Phase':<40s} {'Total(s)':>9s}  {'Calls':>5s}  {'Avg(s)':>9s}  {'% of Block':>10s}")
-            print(f"  {dash*40} {dash*9}  {dash*5}  {dash*9}  {dash*10}")
+            _p(f"\n  [DiT Block Offload Breakdown  (aggregated across all blocks & calls)]")
+            _p(f"  {'Phase':<40s} {'Total(s)':>9s}  {'Calls':>5s}  {'Avg(s)':>9s}  {'% of Block':>10s}")
+            _p(f"  {dash*40} {dash*9}  {dash*5}  {dash*9}  {dash*10}")
             grand = sum(v[0] for v in agg.values())
             for phase, (total, count) in agg.items():
                 avg = total / count if count else 0
                 pct = total / grand * 100 if grand else 0
-                print(f"  {phase:<40s} {total:>9.3f}  {count:>5d}  {avg:>9.3f}  {pct:>9.1f}%")
-            print(f"  {'─'*40} {'─'*9}  {'─'*5}  {'─'*9}  {'─'*10}")
-            print(f"  {'TOTAL (H2D + Compute + D2H)':<40s} {grand:>9.3f}")
+                _p(f"  {phase:<40s} {total:>9.3f}  {count:>5d}  {avg:>9.3f}  {pct:>9.1f}%")
+            _p(f"  {'─'*40} {'─'*9}  {'─'*5}  {'─'*9}  {'─'*10}")
+            _p(f"  {'TOTAL (H2D + Compute + D2H)':<40s} {grand:>9.3f}")
             compute_total = agg.get("Compute", (0, 0))[0]
             if grand > 0:
-                print(f"\n  ★ Pure compute time (excl. offload):  {compute_total:.3f}s  "
-                      f"({compute_total/grand*100:.1f}% of block time)")
+                _p(f"\n  ★ Pure compute time (excl. offload):  {compute_total:.3f}s  "
+                   f"({compute_total/grand*100:.1f}% of block time)")
                 offload_total = grand - compute_total
-                print(f"  ★ Offload overhead (H2D + D2H):       {offload_total:.3f}s  "
-                      f"({offload_total/grand*100:.1f}% of block time)")
+                _p(f"  ★ Offload overhead (H2D + D2H):       {offload_total:.3f}s  "
+                   f"({offload_total/grand*100:.1f}% of block time)")
 
-        print(f"\n{sep}")
-        print(f"  (Wall-clock items use cuda.synchronize; CUDA-Event items are non-blocking)")
-        print(f"  (Sub-items marked with '>' are included in their parent's total)")
-        print(f"{sep}\n")
+        _p(f"\n{sep}")
+        _p(f"  (Wall-clock items use cuda.synchronize; CUDA-Event items are non-blocking)")
+        _p(f"  (Sub-items marked with '>' are included in their parent's total)")
+        _p(f"{sep}\n")
+
+        # ---- Save to log file ----
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_path = os.path.join(log_dir, f"profiling_{ts}.log")
+        with open(log_path, "w") as f:
+            f.write(buf.getvalue())
+        print(f"  Profiling log saved to: {log_path}")
 
     @staticmethod
     def _aggregate_dit_blocks(resolved: OrderedDict) -> OrderedDict:

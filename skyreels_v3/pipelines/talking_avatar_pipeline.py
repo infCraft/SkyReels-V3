@@ -516,7 +516,7 @@ class TalkingAvatarPipeline:
             profiler.start("Denoise Loop (segment 0)")
             progress_wrap = partial(tqdm, total=len(timesteps) - 1) if progress else (lambda x: x)
             for i in progress_wrap(range(len(timesteps) - 1)):
-                profiler.start(f"Denoise Loop (seg 0) > Step {i}")
+                profiler.evt_start(f"Denoise Loop (seg 0) > Step {i}")
                 timestep = timesteps[i]
                 latent_model_input = [latent.to(self.device)]
                 (
@@ -577,7 +577,7 @@ class TalkingAvatarPipeline:
 
                 x0 = [latent.to(self.device)]
                 del latent_model_input, timestep
-                profiler.end(f"Denoise Loop (seg 0) > Step {i}")
+                profiler.evt_end(f"Denoise Loop (seg 0) > Step {i}")
 
             profiler.end("Denoise Loop (segment 0)")
 
@@ -827,7 +827,7 @@ class TalkingAvatarPipeline:
                     profiler.start(f"Denoise Loop (seg {_seg_idx})")
                     for i in progress_wrap(range(len(timesteps) - 1)):
 
-                        profiler.start(f"Denoise Loop (seg {_seg_idx}) > Step {i}")
+                        profiler.evt_start(f"Denoise Loop (seg {_seg_idx}) > Step {i}")
                         # print(timesteps)
                         timestep = timesteps[i]
                         latent_model_input = [latent.to(self.device)]
@@ -907,7 +907,7 @@ class TalkingAvatarPipeline:
 
                         x0 = [latent.to(self.device)]
                         del latent_model_input, timestep
-                        profiler.end(f"Denoise Loop (seg {_seg_idx}) > Step {i}")
+                        profiler.evt_end(f"Denoise Loop (seg {_seg_idx}) > Step {i}")
 
                     profiler.end(f"Denoise Loop (seg {_seg_idx})")
 
