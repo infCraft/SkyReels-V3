@@ -30,6 +30,7 @@ from skyreels_v3.pipelines import (
     TalkingAvatarPipeline,
 )
 from skyreels_v3.utils.avatar_preprocess import preprocess_audio
+from skyreels_v3.utils.profiler import profiler
 
 
 def maybe_download(path_or_url: str, save_dir: str) -> str:
@@ -229,11 +230,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # 自动补全model_id参数，如果用户没有指定，则根据task_type选择默认模型。
     if args.model_id is None:
         args.model_id = MODEL_ID_CONFIG[args.task_type]
     # init multi gpu environment
     local_rank = 0
     if args.use_usp:
+        # torchrun 多卡环境初始化
         from xfuser.core.distributed import (
             init_distributed_environment,
             initialize_model_parallel,
@@ -253,7 +256,7 @@ if __name__ == "__main__":
     device = f"cuda:{local_rank}"
     assert not(args.use_usp and args.low_vram), "usp mode and low_vram mode cannot be used together"
 
-    # In multi-process inference, only rank0 downloads the model; other ranks receive the resolved path via broadcast.
+    # 多卡环境下，仅rank0下载模型文件，然后广播路径到其他rank，避免重复下载浪费时间和带宽。
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         obj_list = [None]
         if dist.get_rank() == 0:
@@ -273,11 +276,12 @@ if __name__ == "__main__":
 
     logging.info(f"input params: {args}")
 
+    # 把输入准备好（下载视频/图片/音频等），并在多卡环境下广播给所有rank，确保每个rank都使用相同的输入路径和数据。对于reference_to_video任务，还会在每个rank上加载参考图片。
     args = prepare_and_broadcast_inputs(args, local_rank)
 
     video_out = None
 
-    # init pipeline
+    # 根据不同的任务类型，初始化对应的Pipeline，并调用生成函数。每个Pipeline内部会根据传入的参数进行视频生成。
     if args.task_type == "single_shot_extension":
         pipe = SingleShotExtensionPipeline(model_path=args.model_id, use_usp=args.use_usp, offload=args.offload, low_vram=args.low_vram)
         video_out = pipe.extend_video(args.input_video, args.prompt, args.duration, args.seed, resolution=args.resolution)
@@ -289,6 +293,7 @@ if __name__ == "__main__":
         video_out = pipe.generate_video(args.ref_imgs, args.prompt, args.duration, args.seed, resolution=args.resolution)
     elif args.task_type == "talking_avatar":
         config = WAN_CONFIGS["talking-avatar-19B"]
+        profiler.start("Pipeline Init (total)")
         pipe = TalkingAvatarPipeline(
             config=config,
             model_path=args.model_id,
@@ -298,6 +303,8 @@ if __name__ == "__main__":
             offload=args.offload,
             low_vram=args.low_vram,
         )
+        profiler.end("Pipeline Init (total)")
+        # 构造输入数据字典，包含文本提示、条件图像和条件音频。对于多卡环境，仅rank0进行音频预处理和文件写入，然后广播结果给其他rank，确保所有rank使用相同的预处理结果。
         input_data = {
             "prompt": args.prompt,
             "cond_image": args.input_image,
@@ -313,7 +320,9 @@ if __name__ == "__main__":
             input_data = obj_list[0]
             dist.barrier()
         else:
+            profiler.start("Audio Preprocess (Wav2Vec2)")
             input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
+            profiler.end("Audio Preprocess (Wav2Vec2)")
         kwargs = {
             "input_data": input_data,
             "size_buckget": args.resolution,
@@ -321,14 +330,16 @@ if __name__ == "__main__":
             "frame_num": 81,
             "drop_frame": 12,
             "shift": 11,
-            "text_guide_scale": 1.0,
-            "audio_guide_scale": 1.0,
+            "text_guide_scale": 1.0,    # 文本 CFG 权重（=1 不做 CFG）
+            "audio_guide_scale": 1.0,   # 音频 CFG 权重（=1 不做 CFG）
             "seed": args.seed,
-            "sampling_steps": 4,
-            "max_frames_num": 5000,
+            "sampling_steps": 4,        # 仅 4 步去噪！
+            "max_frames_num": 5000,     # 最大帧数上限
         }
         print(f"generate video kwargs: {kwargs}")
+        profiler.start("Video Generation (total)")
         video_out = pipe.generate(**kwargs)
+        profiler.end("Video Generation (total)")
     else:
         raise ValueError(f"Invalid task type: {args.task_type}")
 
@@ -340,6 +351,7 @@ if __name__ == "__main__":
         video_out_file = f"{args.seed}_{current_time}.mp4"
         output_path = os.path.join(save_dir, video_out_file)
         fps = 25 if args.task_type == "talking_avatar" else 24
+        profiler.start("Video Save (imageio)")
         imageio.mimwrite(
             output_path,
             video_out,
@@ -347,6 +359,7 @@ if __name__ == "__main__":
             quality=8,
             output_params=["-loglevel", "error"],
         )
+        profiler.end("Video Save (imageio)")
         if args.task_type == "talking_avatar":
             video_with_audio_path = os.path.join(save_dir, video_out_file.replace(".mp4", "_with_audio.mp4"))
             audio_path = kwargs["input_data"]["video_audio"]
@@ -369,6 +382,7 @@ if __name__ == "__main__":
             # fmt: on
 
             try:
+                profiler.start("FFmpeg Audio Merge")
                 subprocess.run(
                     " ".join(cmd),
                     shell=True,
@@ -376,10 +390,14 @@ if __name__ == "__main__":
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                 )
+                profiler.end("FFmpeg Audio Merge")
                 print(f"Video with audio generated successfully: {video_with_audio_path}")
                 os.remove(video_in) # remove the original video
             except subprocess.CalledProcessError as e:
+                profiler.end("FFmpeg Audio Merge")
                 print(f"ffmpeg failed (exit={e.returncode}). Output:\n{e.stdout}")
+
+    profiler.summary()
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

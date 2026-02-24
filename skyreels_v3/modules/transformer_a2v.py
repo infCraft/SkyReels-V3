@@ -13,6 +13,7 @@ from einops import rearrange, repeat
 from xfuser.core.distributed import get_sp_group
 
 from ..utils.avatar_util import get_attn_map_with_target, normalize_and_scale, rotate_half
+from ..utils.profiler import profiler
 from .attention import attention, flash_attention
 
 __all__ = ["WanModel"]
@@ -791,6 +792,8 @@ class WanModel(ModelMixin, ConfigMixin):
     ):
         assert clip_fea is not None and y is not None
 
+        profiler.evt_start("DiT Forward > Embeddings + AudioProj")
+
         # Move pre-block modules to GPU for block offload mode
         if block_offload:
             self.patch_embedding.to("cuda")
@@ -868,6 +871,8 @@ class WanModel(ModelMixin, ConfigMixin):
         human_num = len(audio_embedding)
         audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
 
+        profiler.evt_end("DiT Forward > Embeddings + AudioProj")
+
         # Offload pre-block modules back to CPU after embeddings computation
         if block_offload:
             self.patch_embedding.to("cpu")
@@ -902,23 +907,42 @@ class WanModel(ModelMixin, ConfigMixin):
         )
 
         if block_offload:
-            for block in self.blocks:
+            profiler.evt_start("DiT Forward > Blocks (block_offload)")
+            for _blk_idx, block in enumerate(self.blocks):
+                # ---- H2D Load ----
+                profiler.evt_start(f"DiT Block {_blk_idx} > H2D Load")
                 block.to("cuda")
+                profiler.evt_end(f"DiT Block {_blk_idx} > H2D Load")
+                # ---- Compute ----
+                profiler.evt_start(f"DiT Block {_blk_idx} > Compute")
                 x = block(x, **kwargs)
+                profiler.evt_end(f"DiT Block {_blk_idx} > Compute")
+                # ---- D2H Offload ----
+                profiler.evt_start(f"DiT Block {_blk_idx} > D2H Offload")
                 block.to("cpu")
                 torch.cuda.empty_cache()
+                profiler.evt_end(f"DiT Block {_blk_idx} > D2H Offload")
+            profiler.evt_end("DiT Forward > Blocks (block_offload)")
 
             # head
+            profiler.evt_start("DiT Forward > Head")
             self.head.to("cuda")
             x = self.head(x, e)
             self.head.to("cpu")
             torch.cuda.empty_cache()
+            profiler.evt_end("DiT Forward > Head")
         else:
-            for block in self.blocks:
+            profiler.evt_start("DiT Forward > Blocks (on-device)")
+            for _blk_idx, block in enumerate(self.blocks):
+                profiler.evt_start(f"DiT Block {_blk_idx} > Compute")
                 x = block(x, **kwargs)
+                profiler.evt_end(f"DiT Block {_blk_idx} > Compute")
+            profiler.evt_end("DiT Forward > Blocks (on-device)")
 
             # head
+            profiler.evt_start("DiT Forward > Head")
             x = self.head(x, e)
+            profiler.evt_end("DiT Forward > Head")
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)

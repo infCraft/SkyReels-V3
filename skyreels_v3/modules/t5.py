@@ -533,10 +533,14 @@ class T5EncoderModel(ModelMixin):
         self.tokenizer_path = tokenizer_path
 
         super().__init__()
-        # init model
-        model = umt5_xxl(encoder_only=True, return_tokenizer=False)
+        # init model on meta device (zero memory allocation), then load weights
+        # via mmap (multi-core page fault I/O) + assign (zero-copy parameter replacement)
+        model = umt5_xxl(encoder_only=True, return_tokenizer=False, device="meta")
         logging.info(f"loading {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+        model.load_state_dict(
+            torch.load(checkpoint_path, map_location="cpu", mmap=True),
+            assign=True,
+        )
         self.model = model
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)

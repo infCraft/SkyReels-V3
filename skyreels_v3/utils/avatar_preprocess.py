@@ -76,6 +76,7 @@ def audio_prepare_single(audio_path, sample_rate=16000):
 
 def preprocess_audio(model_path, input_data, audio_save_dir):
 
+    # 初始化 wav2vec 模型和特征提取器。wav2vec 模型用于提取音频特征，特征提取器负责将原始音频转换为模型输入格式。模型文件从指定路径加载，确保本地存在以避免重复下载。
     def custom_init(device, wav2vec):
         audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True).to(device)
         audio_encoder.feature_extractor._freeze_parameters()

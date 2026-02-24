@@ -29,6 +29,7 @@ from ..utils.avatar_util import (
     match_and_blend_colors,
     process_video_samples,
 )
+from ..utils.profiler import profiler
 
 
 def resize_and_centercrop(cond_image, target_size):
@@ -92,21 +93,31 @@ class TalkingAvatarPipeline:
         quant: bool = False,
     ) -> Dict[str, WanModel]:
         print(f"load dit model from: {checkpoint_dir}")
-        state_dict = {}
-        with torch.device("cpu"):
-            for file in os.listdir(checkpoint_dir):
-                if file.endswith(".safetensors"):
-                    state_dict.update(load_file(os.path.join(checkpoint_dir, file)))
 
-        model = WanModel.from_config(os.path.join(checkpoint_dir, "config.json")).to(torch.bfloat16)
-        model.load_state_dict(state_dict, strict=True, assign=True)
-        del state_dict
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Create model skeleton on meta device (zero memory allocation).
+        # Monkey-patch init_weights to skip expensive random initialization
+        # that would be overwritten by checkpoint anyway.
+        _orig_init_weights = WanModel.init_weights
+        WanModel.init_weights = lambda self: None
+        with torch.device("meta"):
+            model = WanModel.from_config(os.path.join(checkpoint_dir, "config.json"))
+        WanModel.init_weights = _orig_init_weights
+
+        # Load safetensors shards one by one to avoid 35GB+ merged state_dict peak.
+        safetensors_files = sorted(
+            f for f in os.listdir(checkpoint_dir) if f.endswith(".safetensors")
+        )
+        for shard_file in safetensors_files:
+            print(f"  loading shard: {shard_file}")
+            shard = load_file(os.path.join(checkpoint_dir, shard_file))
+            model.load_state_dict(shard, strict=False, assign=True)
+            del shard
+            gc.collect()
 
         model.eval().requires_grad_(False)
         model = model.to(torch.bfloat16)
         if quant:
+            # quantize_(model, float8_weight_only()) 是 low_vram 的关键——将所有线性层权重从 bf16 量化为 FP8，显存占用近乎减半。
             quantize_(model, float8_weight_only(), device="cuda")
             print(f"quantize dit model")
 
@@ -135,6 +146,7 @@ class TalkingAvatarPipeline:
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
 
+        profiler.start("Pipeline Init > T5 Encoder Load")
         self.text_encoder = (
             T5EncoderModel(
                 text_len=config.text_len,
@@ -145,26 +157,34 @@ class TalkingAvatarPipeline:
             .to(config.t5_dtype)
             .to("cpu")
         )
+        profiler.end("Pipeline Init > T5 Encoder Load")
 
+        profiler.start("Pipeline Init > CLIP Encoder Load")
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
             device=self.device,
             checkpoint_path=os.path.join(model_path, config.clip_checkpoint),
             tokenizer_path=os.path.join(model_path, config.clip_tokenizer),
         )
+        profiler.end("Pipeline Init > CLIP Encoder Load")
 
+        # 3D Causal VAE，stride=(4,8,8)，即时间维度降采样4x，空间降采样8x
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        profiler.start("Pipeline Init > VAE Load")
         self.vae = WanVAE(
             vae_pth=os.path.join(model_path, config.vae_checkpoint),
         )
+        profiler.end("Pipeline Init > VAE Load")
 
         # load dit model
         logging.info(f"Creating WanModel from {model_path}")
+        profiler.start("Pipeline Init > DiT Load + Quantize")
         self.model = self.init_dit_model(
             checkpoint_dir=model_path,
             quant=quant,
         )["model"]
+        profiler.end("Pipeline Init > DiT Load + Quantize")
 
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
@@ -199,6 +219,7 @@ class TalkingAvatarPipeline:
 
         self.offload = offload
         self.low_vram = low_vram
+        # offload 模式下：T5、CLIP、DiT 全部驻留 CPU，仅 VAE 常驻 GPU（因为 VAE 相对较小）。
         if self.offload:
             self.model.to("cpu")
             self.text_encoder.to("cpu")
@@ -295,9 +316,11 @@ class TalkingAvatarPipeline:
 
         if self.offload:
             self.text_encoder.to(self.device)
+        profiler.start("T5 Text Encode")
         context, context_null, connection_embedding = self.text_encoder.encode(
             [input_prompt, n_prompt, connection_prompt],
         )
+        profiler.end("T5 Text Encode")
         if self.offload:
             self.text_encoder.to("cpu")
             torch.cuda.empty_cache()
@@ -384,7 +407,9 @@ class TalkingAvatarPipeline:
             if self.offload:
                 self.clip.model.to(self.device)
             # get clip embedding
+            profiler.start("CLIP Image Encode")
             clip_context = self.clip.visual(cond_image[:, :, :1, :, :]).to(self.param_dtype)
+            profiler.end("CLIP Image Encode")
             if self.offload:
                 self.clip.model.to("cpu")
                 torch.cuda.empty_cache()
@@ -398,7 +423,9 @@ class TalkingAvatarPipeline:
             ).to(self.device)
             padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
 
+            profiler.start("VAE Encode (segment 0)")
             y = self.vae.encode(padding_frames_pixels_values).to(self.param_dtype)
+            profiler.end("VAE Encode (segment 0)")
             cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num - 1) // 4)
             latent_motion_frames = y[:, :, :cur_motion_frames_latent_num][0]
             y = torch.concat([msk, y], dim=1)  # B 4+C T H W
@@ -486,8 +513,10 @@ class TalkingAvatarPipeline:
             if self.offload and not self.low_vram:
                 self.model.to(self.device)
 
+            profiler.start("Denoise Loop (segment 0)")
             progress_wrap = partial(tqdm, total=len(timesteps) - 1) if progress else (lambda x: x)
             for i in progress_wrap(range(len(timesteps) - 1)):
+                profiler.start(f"Denoise Loop (seg 0) > Step {i}")
                 timestep = timesteps[i]
                 latent_model_input = [latent.to(self.device)]
                 (
@@ -548,18 +577,25 @@ class TalkingAvatarPipeline:
 
                 x0 = [latent.to(self.device)]
                 del latent_model_input, timestep
+                profiler.end(f"Denoise Loop (seg 0) > Step {i}")
+
+            profiler.end("Denoise Loop (segment 0)")
 
             if self.offload and not self.low_vram:
                 self.model.to("cpu")
                 torch.cuda.empty_cache()
 
+            profiler.start("VAE Decode (segment 0)")
             videos = self.vae.decode(x0[0])
+            profiler.end("VAE Decode (segment 0)")
             torch.cuda.empty_cache()
 
         # cache generated samples
         generated_ref_videos = videos
 
+        profiler.start("Color Correction (segment 0)")
         generated_ref_videos = match_and_blend_colors(generated_ref_videos, original_color_reference, 1.0)
+        profiler.end("Color Correction (segment 0)")
         if self.rank == 0:
             processed_generated_ref_videos = process_video_samples(generated_ref_videos)
         else:
@@ -594,8 +630,10 @@ class TalkingAvatarPipeline:
             print(f"generated_ref_videos_final:{generated_ref_videos_final.shape}")
 
             tmp_indx = 0
+            _seg_idx = 1  # segment counter for profiling (segment 0 already done)
             # start video generation iteratively
             while True:
+                profiler.start(f"Segment {_seg_idx} (total)")
                 if audio_end_idx == video_length:
                     arrive_last_frame = True
 
@@ -667,7 +705,9 @@ class TalkingAvatarPipeline:
                     )
                     if self.offload:
                         self.clip.model.to(self.device)
+                    profiler.start(f"CLIP Image Encode (seg {_seg_idx})")
                     clip_context = self.clip.visual(cond_image[:, :, :1, :, :]).to(self.param_dtype)
+                    profiler.end(f"CLIP Image Encode (seg {_seg_idx})")
                     if self.offload:
                         self.clip.model.to("cpu")
                         torch.cuda.empty_cache()
@@ -681,7 +721,9 @@ class TalkingAvatarPipeline:
                     ).to(self.device)
                     padding_frames_pixels_values = torch.concat([cond_image, video_frames, pseudo_frames], dim=2)
 
+                    profiler.start(f"VAE Encode (seg {_seg_idx})")
                     y = self.vae.encode(padding_frames_pixels_values).to(self.param_dtype)
+                    profiler.end(f"VAE Encode (seg {_seg_idx})")
                     cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num - 1) // 4)
                     latent_motion_frames = y[:, :, :cur_motion_frames_latent_num][0]  # C T H W
                     y = torch.concat([msk, y], dim=1)  # B 4+C T H W
@@ -782,8 +824,10 @@ class TalkingAvatarPipeline:
                         latent[:, :T_m] = add_latent
 
                     progress_wrap = partial(tqdm, total=len(timesteps) - 1) if progress else (lambda x: x)
+                    profiler.start(f"Denoise Loop (seg {_seg_idx})")
                     for i in progress_wrap(range(len(timesteps) - 1)):
 
+                        profiler.start(f"Denoise Loop (seg {_seg_idx}) > Step {i}")
                         # print(timesteps)
                         timestep = timesteps[i]
                         latent_model_input = [latent.to(self.device)]
@@ -863,19 +907,26 @@ class TalkingAvatarPipeline:
 
                         x0 = [latent.to(self.device)]
                         del latent_model_input, timestep
+                        profiler.end(f"Denoise Loop (seg {_seg_idx}) > Step {i}")
+
+                    profiler.end(f"Denoise Loop (seg {_seg_idx})")
 
                     if self.offload and not self.low_vram:
                         self.model.to("cpu")
                         torch.cuda.empty_cache()
 
+                    profiler.start(f"VAE Decode (seg {_seg_idx})")
                     videos = self.vae.decode(x0[0])
+                    profiler.end(f"VAE Decode (seg {_seg_idx})")
                     torch.cuda.empty_cache()
 
                 # cache generated samples
                 if not arrive_last_frame:
                     videos = videos[:, :, :-drop_frame]
 
+                profiler.start(f"Color Correction (seg {_seg_idx})")
                 videos = match_and_blend_colors(videos, original_color_reference, 1.0)
+                profiler.end(f"Color Correction (seg {_seg_idx})")
                 if self.rank == 0:
                     processed_videos = process_video_samples(videos)
                 else:
@@ -890,6 +941,7 @@ class TalkingAvatarPipeline:
 
                 # decide whether is done
                 if arrive_last_frame:
+                    profiler.end(f"Segment {_seg_idx} (total)")
                     break
 
                 # update next condition frames
@@ -903,7 +955,11 @@ class TalkingAvatarPipeline:
                 is_first_clip = False
 
                 if max_frames_num <= frame_num:
+                    profiler.end(f"Segment {_seg_idx} (total)")
                     break
+
+                profiler.end(f"Segment {_seg_idx} (total)")
+                _seg_idx += 1
 
                 if dist.is_initialized():
                     dist.barrier()
