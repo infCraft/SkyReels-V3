@@ -11,7 +11,7 @@ python generate_video.py \
     --task_type talking_avatar \
     --model_id $MODEL_PATH \
     --prompt "$PROMPT" \
-    --seed 817 \
+    --seed 42 \
     --input_image "$INPUT_IMAGE" \
     --input_audio "$INPUT_AUDIO" \
     2>&1 | tee run.log
