@@ -263,10 +263,15 @@ class TalkingAvatarPipeline:
         seed=-1,
         max_frames_num=5000,
         progress=True,
+        probe_mode=False,
     ):
         input_prompt = input_data["prompt"]
         cond_file_path = input_data["cond_image"]
         cond_image = Image.open(cond_file_path).convert("RGB")
+
+        # ---- Pass probe_mode to model ----
+        if probe_mode:
+            self.model.probe_mode = True
 
         # decide a proper size
         if size_buckget == "480P":
@@ -517,6 +522,7 @@ class TalkingAvatarPipeline:
             progress_wrap = partial(tqdm, total=len(timesteps) - 1) if progress else (lambda x: x)
             for i in progress_wrap(range(len(timesteps) - 1)):
                 profiler.evt_start(f"Denoise Loop (seg 0) > Step {i}")
+                self.model.current_denoise_step = i
                 timestep = timesteps[i]
                 latent_model_input = [latent.to(self.device)]
                 (
@@ -580,6 +586,14 @@ class TalkingAvatarPipeline:
                 profiler.evt_end(f"Denoise Loop (seg 0) > Step {i}")
 
             profiler.end("Denoise Loop (segment 0)")
+
+            # ---- Disable probe after segment 0 to avoid overwriting results ----
+            if probe_mode:
+                self.model.probe_mode = False
+                logging.info(
+                    f"Probe mode disabled after segment 0. "
+                    f"Collected {len(self.model.probe_results)} (step, block) entries."
+                )
 
             if self.offload and not self.low_vram:
                 self.model.to("cpu")
@@ -828,6 +842,7 @@ class TalkingAvatarPipeline:
                     for i in progress_wrap(range(len(timesteps) - 1)):
 
                         profiler.evt_start(f"Denoise Loop (seg {_seg_idx}) > Step {i}")
+                        self.model.current_denoise_step = i
                         # print(timesteps)
                         timestep = timesteps[i]
                         latent_model_input = [latent.to(self.device)]

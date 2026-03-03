@@ -777,6 +777,34 @@ class WanModel(ModelMixin, ConfigMixin):
         self.init_weights()
         self.enable_teacache = False
 
+        # ---- Probe & Skip attributes (for step-block pruning experiments) ----
+        self.current_denoise_step = -1  # Set by pipeline before each forward call
+        self.probe_mode = False          # Enable sensitivity probe
+        self.probe_results = {}          # {(step, block_idx): {"cos_sim": float, "res_mag": float}}
+        self.skip_set = set()            # {(step, block_idx)} pairs to skip (Identity Skip)
+
+    def _compute_block_redundancy(self, x_in, x_out):
+        """
+        Compute per-block redundancy metrics for sensitivity probing.
+        Only computes raw metrics (cos_sim, res_mag) on GPU.
+        CFPS is computed offline in analyze_probe.py with configurable alpha.
+
+        Args:
+            x_in:  input to block,  shape [B, seq_len, dim], bf16
+            x_out: output of block, shape [B, seq_len, dim], bf16
+
+        Returns:
+            (cos_sim, res_mag) as Python floats
+        """
+        # Cosine similarity (token-wise average)
+        cos_sim = F.cosine_similarity(x_in, x_out, dim=-1).mean().item()
+
+        # Relative residual magnitude
+        residual = x_out - x_in
+        res_mag = (residual.norm(p=2) / (x_in.norm(p=2) + 1e-8)).item()
+
+        return cos_sim, res_mag
+
     def forward(
         self,
         x,
@@ -909,14 +937,34 @@ class WanModel(ModelMixin, ConfigMixin):
         if block_offload:
             profiler.evt_start("DiT Forward > Blocks (block_offload)")
             for _blk_idx, block in enumerate(self.blocks):
+                # ---- Skip routing ----
+                if self.skip_set and (self.current_denoise_step, _blk_idx) in self.skip_set:
+                    profiler.evt_start(f"DiT Block {_blk_idx} > Skipped")
+                    profiler.evt_end(f"DiT Block {_blk_idx} > Skipped")
+                    continue
+
                 # ---- H2D Load ----
                 profiler.evt_start(f"DiT Block {_blk_idx} > H2D Load")
                 block.to("cuda")
                 profiler.evt_end(f"DiT Block {_blk_idx} > H2D Load")
+
+                # ---- Probe: save input ----
+                if self.probe_mode:
+                    x_input = x.detach()
+
                 # ---- Compute ----
                 profiler.evt_start(f"DiT Block {_blk_idx} > Compute")
                 x = block(x, **kwargs)
                 profiler.evt_end(f"DiT Block {_blk_idx} > Compute")
+
+                # ---- Probe: compute metrics ----
+                if self.probe_mode:
+                    cos_sim, res_mag = self._compute_block_redundancy(x_input, x)
+                    self.probe_results[(self.current_denoise_step, _blk_idx)] = {
+                        "cos_sim": cos_sim, "res_mag": res_mag
+                    }
+                    del x_input
+
                 # ---- D2H Offload ----
                 profiler.evt_start(f"DiT Block {_blk_idx} > D2H Offload")
                 block.to("cpu")
@@ -934,9 +982,28 @@ class WanModel(ModelMixin, ConfigMixin):
         else:
             profiler.evt_start("DiT Forward > Blocks (on-device)")
             for _blk_idx, block in enumerate(self.blocks):
+                # ---- Skip routing ----
+                if self.skip_set and (self.current_denoise_step, _blk_idx) in self.skip_set:
+                    profiler.evt_start(f"DiT Block {_blk_idx} > Skipped")
+                    profiler.evt_end(f"DiT Block {_blk_idx} > Skipped")
+                    continue
+
+                # ---- Probe: save input ----
+                if self.probe_mode:
+                    x_input = x.detach()
+
                 profiler.evt_start(f"DiT Block {_blk_idx} > Compute")
                 x = block(x, **kwargs)
                 profiler.evt_end(f"DiT Block {_blk_idx} > Compute")
+
+                # ---- Probe: compute metrics ----
+                if self.probe_mode:
+                    cos_sim, res_mag = self._compute_block_redundancy(x_input, x)
+                    self.probe_results[(self.current_denoise_step, _blk_idx)] = {
+                        "cos_sim": cos_sim, "res_mag": res_mag
+                    }
+                    del x_input
+
             profiler.evt_end("DiT Forward > Blocks (on-device)")
 
             # head

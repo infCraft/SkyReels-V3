@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import random
@@ -228,6 +229,32 @@ if __name__ == "__main__":
         "Audio duration must be <= 200 seconds. Supports multiple languages.",
     )
 
+    # ==================== Batch & Probe Parameters ====================
+    parser.add_argument(
+        "--manifest_json",
+        type=str,
+        default=None,
+        help="Path to a manifest JSON file for batch inference. Each entry should contain "
+        "{id, ref_image_path, audio_path, gt_video_path, prompt}.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory for batch inference results.",
+    )
+    parser.add_argument(
+        "--probe_mode",
+        action="store_true",
+        help="Enable sensitivity probe mode (Phase 2). Records per-block redundancy metrics (cos_sim, res_mag).",
+    )
+    parser.add_argument(
+        "--skip_list_json",
+        type=str,
+        default=None,
+        help="Path to a skip-list JSON file for block pruning (Phase 3).",
+    )
+
     args = parser.parse_args()
 
     # 自动补全model_id参数，如果用户没有指定，则根据task_type选择默认模型。
@@ -304,49 +331,145 @@ if __name__ == "__main__":
             low_vram=args.low_vram,
         )
         profiler.end("Pipeline Init (total)")
-        # 构造输入数据字典，包含文本提示、条件图像和条件音频。对于多卡环境，仅rank0进行音频预处理和文件写入，然后广播结果给其他rank，确保所有rank使用相同的预处理结果。
-        input_data = {
-            "prompt": args.prompt,
-            "cond_image": args.input_image,
-            "cond_audio": {"person1": args.input_audio},
-        }
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            # Only rank0 does the heavy audio preprocess + file writes, then broadcasts the result.
-            obj_list = [None]
-            if dist.get_rank() == 0:
-                input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
-                obj_list[0] = input_data
-            dist.broadcast_object_list(obj_list, src=0)
-            input_data = obj_list[0]
-            dist.barrier()
+
+        # ---- Configure probe / skip attributes on the DiT model ----
+        if args.probe_mode:
+            pipe.model.probe_mode = True
+            logging.info("Probe mode enabled. Raw metrics (cos_sim, res_mag) will be recorded.")
+
+        if args.skip_list_json:
+            with open(args.skip_list_json, "r") as f:
+                skip_list = json.load(f)
+            pipe.model.skip_set = set(tuple(pair) for pair in skip_list)
+            logging.info(f"Loaded skip_set with {len(pipe.model.skip_set)} (step, block) pairs")
+
+        # ---- Build list of input_data items (single or batch from manifest) ----
+        manifest_items = []
+        if args.manifest_json:
+            with open(args.manifest_json, "r") as f:
+                manifest_items = json.load(f)
+            logging.info(f"Loaded manifest with {len(manifest_items)} items from {args.manifest_json}")
         else:
-            profiler.start("Audio Preprocess (Wav2Vec2)")
-            input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
-            profiler.end("Audio Preprocess (Wav2Vec2)")
-        kwargs = {
-            "input_data": input_data,
-            "size_buckget": args.resolution,
-            "motion_frame": 5,
-            "frame_num": 81,
-            "drop_frame": 12,
-            "shift": 11,
-            "text_guide_scale": 1.0,    # 文本 CFG 权重（=1 不做 CFG）
-            "audio_guide_scale": 1.0,   # 音频 CFG 权重（=1 不做 CFG）
-            "seed": args.seed,
-            "sampling_steps": 4,        # 仅 4 步去噪！
-            "max_frames_num": 5000,     # 最大帧数上限
-        }
-        print(f"generate video kwargs: {kwargs}")
-        profiler.start("Video Generation (total)")
-        video_out = pipe.generate(**kwargs)
-        profiler.end("Video Generation (total)")
+            # Single-item mode: wrap the CLI args into a pseudo-manifest entry
+            manifest_items = [{
+                "id": "single",
+                "ref_image_path": args.input_image,
+                "audio_path": args.input_audio,
+                "gt_video_path": None,
+                "prompt": args.prompt,
+            }]
+
+        batch_output_dir = args.output_dir or os.path.join("result", args.task_type)
+        os.makedirs(batch_output_dir, exist_ok=True)
+        batch_timing = {}  # video_id -> wall_clock_seconds
+
+        for item_idx, item in enumerate(manifest_items):
+            video_id = item["id"]
+            logging.info(f"[{item_idx+1}/{len(manifest_items)}] Processing video_id={video_id}")
+
+            # 构造输入数据字典
+            input_data = {
+                "prompt": item.get("prompt", args.prompt),
+                "cond_image": item["ref_image_path"],
+                "cond_audio": {"person1": item["audio_path"]},
+            }
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                obj_list = [None]
+                if dist.get_rank() == 0:
+                    input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
+                    obj_list[0] = input_data
+                dist.broadcast_object_list(obj_list, src=0)
+                input_data = obj_list[0]
+                dist.barrier()
+            else:
+                profiler.start(f"Audio Preprocess ({video_id})")
+                input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
+                profiler.end(f"Audio Preprocess ({video_id})")
+
+            kwargs = {
+                "input_data": input_data,
+                "size_buckget": args.resolution,
+                "motion_frame": 5,
+                "frame_num": 81,
+                "drop_frame": 12,
+                "shift": 11,
+                "text_guide_scale": 1.0,
+                "audio_guide_scale": 1.0,
+                "seed": args.seed,
+                "sampling_steps": 4,
+                "max_frames_num": 5000,
+                "probe_mode": args.probe_mode,
+            }
+            logging.info(f"generate video kwargs: {kwargs}")
+
+            t_start = time.time()
+            profiler.start(f"Video Generation ({video_id})")
+            video_out = pipe.generate(**kwargs)
+            profiler.end(f"Video Generation ({video_id})")
+            wall_time = time.time() - t_start
+            batch_timing[video_id] = wall_time
+            logging.info(f"Video {video_id} generated in {wall_time:.2f}s")
+
+            # ---- Save probe results if in probe mode ----
+            if args.probe_mode and hasattr(pipe.model, "probe_results") and pipe.model.probe_results:
+                probe_out_path = os.path.join(batch_output_dir, f"{video_id}_probe.json")
+                # Convert tuple keys to string keys for JSON serialization
+                probe_serializable = {}
+                for k, v in pipe.model.probe_results.items():
+                    key_str = f"{k[0]}_{k[1]}"  # "step_blockidx"
+                    probe_serializable[key_str] = v
+                with open(probe_out_path, "w") as f:
+                    json.dump(probe_serializable, f, indent=2)
+                logging.info(f"Saved probe results to {probe_out_path} ({len(probe_serializable)} entries)")
+                pipe.model.probe_results = {}  # Clear for next video
+
+            # ---- Save generated video ----
+            if local_rank == 0 and video_out is not None:
+                video_out_file = f"{video_id}_{args.seed}.mp4"
+                output_path = os.path.join(batch_output_dir, video_out_file)
+                imageio.mimwrite(
+                    output_path,
+                    video_out,
+                    fps=25,
+                    quality=8,
+                    output_params=["-loglevel", "error"],
+                )
+                # Merge audio
+                if "video_audio" in input_data:
+                    video_with_audio_path = os.path.join(batch_output_dir, f"{video_id}_{args.seed}_with_audio.mp4")
+                    audio_path = input_data["video_audio"]
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', f'"{os.path.abspath(output_path)}"',
+                        '-i', f'"{os.path.abspath(audio_path)}"',
+                        '-map', '0:v', '-map', '1:a',
+                        '-c:v', 'copy', '-shortest',
+                        f'"{os.path.abspath(video_with_audio_path)}"'
+                    ]
+                    try:
+                        subprocess.run(" ".join(cmd), shell=True, check=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                        logging.info(f"Saved video with audio: {video_with_audio_path}")
+                        os.remove(output_path)
+                    except subprocess.CalledProcessError as e:
+                        logging.warning(f"ffmpeg failed for {video_id}: {e.stdout}")
+
+        # ---- Save batch timing summary ----
+        if len(manifest_items) > 1:
+            timing_path = os.path.join(batch_output_dir, "batch_timing.json")
+            with open(timing_path, "w") as f:
+                json.dump(batch_timing, f, indent=2)
+            logging.info(f"Saved batch timing to {timing_path}")
+
+        # Skip the default save logic below for talking_avatar (already handled)
+        video_out = None
     else:
         raise ValueError(f"Invalid task type: {args.task_type}")
 
     save_dir = os.path.join("result", args.task_type)
     os.makedirs(save_dir, exist_ok=True)
 
-    if local_rank == 0:
+    if local_rank == 0 and video_out is not None:
         current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
         video_out_file = f"{args.seed}_{current_time}.mp4"
         output_path = os.path.join(save_dir, video_out_file)
