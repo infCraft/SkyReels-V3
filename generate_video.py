@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import random
@@ -227,6 +228,19 @@ if __name__ == "__main__":
         help="[talking_avatar] Driving audio path or URL. Supports mp3, wav formats. "
         "Audio duration must be <= 200 seconds. Supports multiple languages.",
     )
+    parser.add_argument(
+        "--manifest_json",
+        type=str,
+        default=None,
+        help="[talking_avatar] Path to a manifest JSON file for batch inference. "
+        "Each item should include: {id, ref_image_path, audio_path, prompt(optional)}.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="[talking_avatar] Output directory for batch inference results.",
+    )
 
     args = parser.parse_args()
 
@@ -276,8 +290,10 @@ if __name__ == "__main__":
 
     logging.info(f"input params: {args}")
 
-    # 把输入准备好（下载视频/图片/音频等），并在多卡环境下广播给所有rank，确保每个rank都使用相同的输入路径和数据。对于reference_to_video任务，还会在每个rank上加载参考图片。
-    args = prepare_and_broadcast_inputs(args, local_rank)
+    # 把输入准备好（下载视频/图片/音频等），并在多卡环境下广播给所有rank，确保每个rank都使用相同的输入路径和数据。
+    # talking_avatar 的 manifest 批量模式在分支内逐条处理输入，这里跳过统一预处理。
+    if not (args.task_type == "talking_avatar" and args.manifest_json):
+        args = prepare_and_broadcast_inputs(args, local_rank)
 
     video_out = None
 
@@ -304,49 +320,144 @@ if __name__ == "__main__":
             low_vram=args.low_vram,
         )
         profiler.end("Pipeline Init (total)")
-        # 构造输入数据字典，包含文本提示、条件图像和条件音频。对于多卡环境，仅rank0进行音频预处理和文件写入，然后广播结果给其他rank，确保所有rank使用相同的预处理结果。
-        input_data = {
-            "prompt": args.prompt,
-            "cond_image": args.input_image,
-            "cond_audio": {"person1": args.input_audio},
-        }
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            # Only rank0 does the heavy audio preprocess + file writes, then broadcasts the result.
-            obj_list = [None]
-            if dist.get_rank() == 0:
-                input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
-                obj_list[0] = input_data
-            dist.broadcast_object_list(obj_list, src=0)
-            input_data = obj_list[0]
-            dist.barrier()
+        if args.manifest_json:
+            with open(args.manifest_json, "r") as f:
+                manifest_items = json.load(f)
+            logging.info(f"Loaded manifest with {len(manifest_items)} items from {args.manifest_json}")
+
+            batch_output_dir = args.output_dir or os.path.join("result", args.task_type)
+            os.makedirs(batch_output_dir, exist_ok=True)
+
+            for item_idx, item in enumerate(manifest_items):
+                video_id = item.get("id", f"sample_{item_idx:04d}")
+                logging.info(f"[{item_idx + 1}/{len(manifest_items)}] Processing video_id={video_id}")
+
+                input_image = item["ref_image_path"]
+                input_audio = item["audio_path"]
+                prompt = item.get("prompt", args.prompt)
+
+                input_data = {
+                    "prompt": prompt,
+                    "cond_image": input_image,
+                    "cond_audio": {"person1": input_audio},
+                }
+
+                if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                    obj_list = [None]
+                    if dist.get_rank() == 0:
+                        input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
+                        obj_list[0] = input_data
+                    dist.broadcast_object_list(obj_list, src=0)
+                    input_data = obj_list[0]
+                    dist.barrier()
+                else:
+                    profiler.start(f"Audio Preprocess ({video_id})")
+                    input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
+                    profiler.end(f"Audio Preprocess ({video_id})")
+
+                kwargs = {
+                    "input_data": input_data,
+                    "size_buckget": args.resolution,
+                    "motion_frame": 5,
+                    "frame_num": 81,
+                    "drop_frame": 12,
+                    "shift": 11,
+                    "text_guide_scale": 1.0,
+                    "audio_guide_scale": 1.0,
+                    "seed": args.seed,
+                    "sampling_steps": 4,
+                    "max_frames_num": 5000,
+                }
+                logging.info(f"generate video kwargs: {kwargs}")
+                profiler.start(f"Video Generation ({video_id})")
+                video_out = pipe.generate(**kwargs)
+                profiler.end(f"Video Generation ({video_id})")
+
+                if local_rank == 0 and video_out is not None:
+                    output_path = os.path.join(batch_output_dir, f"{video_id}_{args.seed}.mp4")
+                    imageio.mimwrite(
+                        output_path,
+                        video_out,
+                        fps=25,
+                        quality=8,
+                        output_params=["-loglevel", "error"],
+                    )
+
+                    if "video_audio" in input_data:
+                        video_with_audio_path = os.path.join(batch_output_dir, f"{video_id}_{args.seed}_with_audio.mp4")
+                        video_in = os.path.abspath(output_path)
+                        audio_in = os.path.abspath(input_data["video_audio"])
+                        video_out_with_audio = os.path.abspath(video_with_audio_path)
+                        cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-i", f'"{video_in}"',
+                            "-i", f'"{audio_in}"',
+                            "-map", "0:v",
+                            "-map", "1:a",
+                            "-c:v", "copy",
+                            "-shortest",
+                            f'"{video_out_with_audio}"',
+                        ]
+                        try:
+                            subprocess.run(
+                                " ".join(cmd),
+                                shell=True,
+                                check=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                            )
+                            logging.info(f"Saved video with audio: {video_with_audio_path}")
+                            os.remove(video_in)
+                        except subprocess.CalledProcessError as e:
+                            logging.warning(f"ffmpeg failed for {video_id}: {e.stdout}")
+
+            # 批量模式下不走默认单视频保存逻辑
+            video_out = None
         else:
-            profiler.start("Audio Preprocess (Wav2Vec2)")
-            input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
-            profiler.end("Audio Preprocess (Wav2Vec2)")
-        kwargs = {
-            "input_data": input_data,
-            "size_buckget": args.resolution,
-            "motion_frame": 5,
-            "frame_num": 81,
-            "drop_frame": 12,
-            "shift": 11,
-            "text_guide_scale": 1.0,    # 文本 CFG 权重（=1 不做 CFG）
-            "audio_guide_scale": 1.0,   # 音频 CFG 权重（=1 不做 CFG）
-            "seed": args.seed,
-            "sampling_steps": 4,        # 仅 4 步去噪！
-            "max_frames_num": 5000,     # 最大帧数上限
-        }
-        print(f"generate video kwargs: {kwargs}")
-        profiler.start("Video Generation (total)")
-        video_out = pipe.generate(**kwargs)
-        profiler.end("Video Generation (total)")
+            # 单样本模式
+            input_data = {
+                "prompt": args.prompt,
+                "cond_image": args.input_image,
+                "cond_audio": {"person1": args.input_audio},
+            }
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                # Only rank0 does the heavy audio preprocess + file writes, then broadcasts the result.
+                obj_list = [None]
+                if dist.get_rank() == 0:
+                    input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
+                    obj_list[0] = input_data
+                dist.broadcast_object_list(obj_list, src=0)
+                input_data = obj_list[0]
+                dist.barrier()
+            else:
+                profiler.start("Audio Preprocess (Wav2Vec2)")
+                input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
+                profiler.end("Audio Preprocess (Wav2Vec2)")
+            kwargs = {
+                "input_data": input_data,
+                "size_buckget": args.resolution,
+                "motion_frame": 5,
+                "frame_num": 81,
+                "drop_frame": 12,
+                "shift": 11,
+                "text_guide_scale": 1.0,    # 文本 CFG 权重（=1 不做 CFG）
+                "audio_guide_scale": 1.0,   # 音频 CFG 权重（=1 不做 CFG）
+                "seed": args.seed,
+                "sampling_steps": 4,        # 仅 4 步去噪！
+                "max_frames_num": 5000,     # 最大帧数上限
+            }
+            print(f"generate video kwargs: {kwargs}")
+            profiler.start("Video Generation (total)")
+            video_out = pipe.generate(**kwargs)
+            profiler.end("Video Generation (total)")
     else:
         raise ValueError(f"Invalid task type: {args.task_type}")
 
     save_dir = os.path.join("result", args.task_type)
     os.makedirs(save_dir, exist_ok=True)
 
-    if local_rank == 0:
+    if local_rank == 0 and video_out is not None:
         current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
         video_out_file = f"{args.seed}_{current_time}.mp4"
         output_path = os.path.join(save_dir, video_out_file)

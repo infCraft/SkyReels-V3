@@ -17,3 +17,7 @@ python tools/prepare_hdtf.py \
 
 生成好的视频，音频和参考图片会存在`experiments/hdtf_processed/`里面。在`experiments/`文件夹下还会存在两个manifest文件，代表标定数据集和测试数据集。
 
+## 实现批量推理
+修改了`generate_video.py`，实现了使用manifest文件进行批量推理。
+
+具体方式可以参考`scripts/run_talking_avatar_manifest.sh`。

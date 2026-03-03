@@ -155,6 +155,23 @@ Generates lifelike talking avatars from a single portrait and an audio clip (up 
 > * The `--input_image` parameter specifies the first-frame image for talking avatar generation (URL or local path). Supported formats: `jpg/jpeg`, `png`, `gif`, `bmp`.
 > * The `--input_audio` parameter specifies the driving audio (URL or local path). Currently supports one audio track. Supported formats: `mp3`, `wav`. Audio duration must be `<= 200 seconds`.
 
+- **Batch Inference with Manifest (`manifest.json`):**
+  ```bash
+  python3 generate_video.py --task_type talking_avatar --model_id /root/autodl-tmp/SkyReels-V3-A2V-19B --prompt "A high-quality video of a person talking to the camera, natural lighting, realistic." --seed 42 --manifest_json /root/autodl-fs/experiments/evaluation_manifest.json --output_dir /root/autodl-fs/experiments/baseline_results
+  ```
+
+> Manifest format example (JSON array):
+> ```json
+> [
+>   {
+>     "id": "hdtf_0010",
+>     "ref_image_path": "/path/to/reference_image.jpg",
+>     "audio_path": "/path/to/audio.wav",
+>     "prompt": "A high-quality video of a person talking to the camera, natural lighting, realistic."
+>   }
+> ]
+> ```
+
 ---
 
 ### 📉 Memory Optimization (Low VRAM)
