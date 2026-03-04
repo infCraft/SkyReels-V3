@@ -21,3 +21,20 @@ python tools/prepare_hdtf.py \
 修改了`generate_video.py`，实现了使用manifest文件进行批量推理。
 
 具体方式可以参考`scripts/run_talking_avatar_manifest.sh`。
+
+## FVD, PSNR, SSIM, LSISP指标评测
+首先，先在`evaluate/`文件夹当中`git clone https://github.com/JunyaoHu/common_metrics_on_video_quality.git`。
+
+克隆完毕后，按照[README](evaluate/common_metrics_on_video_quality/README.md)来配置一个conda环境，比如叫eval。
+
+配置完毕后，运行以下脚本，需要在GPU环境下运行测试。
+```sh
+conda activate eval
+
+python evaluate/batch_evaluate.py \
+    --manifest /root/autodl-fs/experiments/evaluation_manifest.json \
+    --gen_dir /root/autodl-fs/experiments/baseline_results \
+    --seed 42 \
+    --output_dir /root/autodl-fs/experiments/baseline_metrics_v2
+```
+
