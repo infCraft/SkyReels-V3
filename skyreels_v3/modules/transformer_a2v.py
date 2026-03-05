@@ -510,7 +510,13 @@ class WanAttentionBlock(nn.Module):
         dtype = x.dtype
         e = (self.modulation + e).chunk(6, dim=1)
 
+        # sub-module profiling guard
+        _bid = getattr(self, 'block_idx', None)
+        _sp = profiler.submodule_profiling and _bid is not None
+
         # self-attention
+        if _sp:
+            profiler.evt_start(f"DiT Block {_bid} > SA")
         y, x_ref_attn_map = self.self_attn(
             (self.norm1(x) * (1 + e[1]) + e[0]),
             seq_lens,
@@ -522,11 +528,19 @@ class WanAttentionBlock(nn.Module):
         x = x + y * e[2]
 
         x = x.to(dtype)
+        if _sp:
+            profiler.evt_end(f"DiT Block {_bid} > SA")
 
         # cross-attention of text
+        if _sp:
+            profiler.evt_start(f"DiT Block {_bid} > CCA")
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        if _sp:
+            profiler.evt_end(f"DiT Block {_bid} > CCA")
 
         # cross attn of audio
+        if _sp:
+            profiler.evt_start(f"DiT Block {_bid} > ACA")
         x_a = self.audio_cross_attn(
             self.norm_x(x),
             encoder_hidden_states=audio_embedding,
@@ -540,11 +554,18 @@ class WanAttentionBlock(nn.Module):
             x_a = x_a * audio_mask
 
         x = x + x_a
+        if _sp:
+            profiler.evt_end(f"DiT Block {_bid} > ACA")
 
+        # ffn
+        if _sp:
+            profiler.evt_start(f"DiT Block {_bid} > FFN")
         y = self.ffn((self.norm2(x) * (1 + e[4]) + e[3]))
         x = x + y * e[5]
 
         x = x.to(dtype)
+        if _sp:
+            profiler.evt_end(f"DiT Block {_bid} > FFN")
 
         return x
 
@@ -746,6 +767,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 for _ in range(num_layers)
             ]
         )
+        for _i, _blk in enumerate(self.blocks):
+            _blk.block_idx = _i
 
         # head
         self.head = Head(dim, out_dim, patch_size, eps)

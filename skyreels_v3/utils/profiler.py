@@ -48,6 +48,9 @@ class InferenceProfiler:
     * ``evt_start/end``  — ``torch.cuda.Event``    (fine-grained GPU, zero stall)
     """
 
+    # Sub-module names used for fine-grained DiT block profiling.
+    _SUBMODULE_PHASES = {"SA", "CCA", "ACA", "FFN"}
+
     def __init__(self):
         # ---- wall-clock mode ----
         self.wall_timings: OrderedDict[str, list[float]] = OrderedDict()
@@ -57,6 +60,9 @@ class InferenceProfiler:
         # Each entry stores a list of (start_event, end_event) pairs.
         self.event_timings: OrderedDict[str, list[tuple]] = OrderedDict()
         self._event_starts: dict[str, torch.cuda.Event] = {}
+
+        # ---- sub-module profiling (SA / CCA / ACA / FFN inside each DiT block) ----
+        self.submodule_profiling: bool = False
 
     # ================================================================== #
     #  Wall-clock API  (coarse pipeline stages)
@@ -169,6 +175,20 @@ class InferenceProfiler:
                 _p(f"  ★ Offload overhead (H2D + D2H):       {offload_total:.3f}s  "
                    f"({offload_total/grand*100:.1f}% of block time)")
 
+        # ---- Section 4: Aggregated DiT block sub-module breakdown ----
+        submod_agg = self._aggregate_dit_submodules(resolved)
+        if submod_agg:
+            _p(f"\n  [DiT Block Sub-module Breakdown  (aggregated across all blocks & steps)]")
+            _p(f"  {'Sub-module':<40s} {'Total(s)':>9s}  {'Calls':>5s}  {'Avg(s)':>9s}  {'% of Block':>10s}")
+            _p(f"  {dash*40} {dash*9}  {dash*5}  {dash*9}  {dash*10}")
+            grand = sum(v[0] for v in submod_agg.values())
+            for submod, (total, count) in submod_agg.items():
+                avg = total / count if count else 0
+                pct = total / grand * 100 if grand else 0
+                _p(f"  {submod:<40s} {total:>9.3f}  {count:>5d}  {avg:>9.3f}  {pct:>9.1f}%")
+            _p(f"  {'─'*40} {'─'*9}  {'─'*5}  {'─'*9}  {'─'*10}")
+            _p(f"  {'TOTAL (SA + CCA + ACA + FFN)':<40s} {grand:>9.3f}")
+
         _p(f"\n{sep}")
         _p(f"  (Wall-clock items use cuda.synchronize; CUDA-Event items are non-blocking)")
         _p(f"  (Sub-items marked with '>' are included in their parent's total)")
@@ -184,18 +204,42 @@ class InferenceProfiler:
 
     @staticmethod
     def _aggregate_dit_blocks(resolved: OrderedDict) -> OrderedDict:
-        """Aggregate DiT block phases into H2D / Compute / D2H buckets."""
+        """Aggregate DiT block phases into H2D / Compute / D2H buckets.
+
+        Sub-module phases (SA, CCA, ACA, FFN) are excluded so that the
+        offload breakdown does not double-count Compute time.
+        """
         pattern = re.compile(r"DiT Block \d+ > (.+)")
         buckets: OrderedDict[str, list[float]] = OrderedDict()
         for name, times in resolved.items():
             m = pattern.search(name)
             if m:
                 phase = m.group(1)
+                if phase in InferenceProfiler._SUBMODULE_PHASES:
+                    continue
                 buckets.setdefault(phase, []).extend(times)
         if not buckets:
             return OrderedDict()
         return OrderedDict(
             (phase, (sum(vals), len(vals))) for phase, vals in buckets.items()
+        )
+
+    @staticmethod
+    def _aggregate_dit_submodules(resolved: OrderedDict) -> OrderedDict:
+        """Aggregate SA / CCA / ACA / FFN timings across all DiT blocks."""
+        pattern = re.compile(
+            r"DiT Block \d+ > (" + "|".join(InferenceProfiler._SUBMODULE_PHASES) + r")$"
+        )
+        buckets: OrderedDict[str, list[float]] = OrderedDict()
+        for name, times in resolved.items():
+            m = pattern.search(name)
+            if m:
+                submod = m.group(1)
+                buckets.setdefault(submod, []).extend(times)
+        if not buckets:
+            return OrderedDict()
+        return OrderedDict(
+            (submod, (sum(vals), len(vals))) for submod, vals in buckets.items()
         )
 
 

@@ -241,8 +241,17 @@ if __name__ == "__main__":
         default=None,
         help="[talking_avatar] Output directory for batch inference results.",
     )
+    parser.add_argument(
+        "--submodule_profiling",
+        action="store_true",
+        help="Enable fine-grained profiling of DiT block sub-modules (SA / CCA / ACA / FFN).",
+    )
 
     args = parser.parse_args()
+
+    # Enable sub-module profiling if requested
+    if args.submodule_profiling:
+        profiler.submodule_profiling = True
 
     # 自动补全model_id参数，如果用户没有指定，则根据task_type选择默认模型。
     if args.model_id is None:

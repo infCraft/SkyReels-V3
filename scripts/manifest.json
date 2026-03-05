@@ -1,0 +1,8 @@
+[
+  {
+    "id": "test01",
+    "ref_image_path": "/root/SkyReels-V3/input_image/woman.JPEG",
+    "audio_path": "/root/SkyReels-V3/input_audio/woman_5s.mp3",
+    "prompt": "A high-quality video of a person talking to the camera, natural lighting, realistic."
+  }
+]
