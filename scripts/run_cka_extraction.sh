@@ -11,11 +11,12 @@ MODEL_PATH="/root/autodl-tmp/SkyReels-V3-A2V-19B"
 MANIFEST_JSON="/root/autodl-fs/experiments/calibration_manifest.json"
 OUTPUT_DIR="/root/autodl-fs/experiments/cka_analysis"
 
-cd /root/SkyReels-V3
+cd /root/SkyReels-V3-cka
 
 python scripts/cka_extract.py \
     --model_id "$MODEL_PATH" \
     --manifest_json "$MANIFEST_JSON" \
     --output_dir "$OUTPUT_DIR" \
     --num_subsample_tokens 8192 \
-    --seed 42
+    --seed 42 \
+    --num_gpus 1

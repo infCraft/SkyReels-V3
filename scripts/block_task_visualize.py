@@ -5,14 +5,14 @@ Block 任务可视化脚本
 读取 cka_extract.py 产出的空间统计数据，生成以下可视化：
 1. 残差 L2 范数空间热力图 (Residual Energy Map)
 2. 残差 PCA 主成分 RGB 映射 (Residual PCA)
-3. 残差频域分析 (Residual FFT) — 径向频率曲线 + 频段能量比例热力图
+3. Block 空间集中度分析 (Gini 系数)
 
 用法:
     python scripts/block_task_visualize.py \
         --input_dir /root/autodl-fs/experiments/cka_analysis/spatial_stats \
         --output_dir /root/autodl-fs/experiments/cka_analysis/visualizations \
         --sample_id hdtf_0000
-    或者不指定 --sample_id 则对所有样本取平均
+    或者不指定 --sample_id 则对所有样本取平均（仅对 res_norm 有效，PCA 保留第一个样本）
 """
 
 import argparse
@@ -71,18 +71,20 @@ def load_spatial_stats(input_dir, sample_id=None):
                     sum_stats[key] = {
                         'res_norm': data['res_norm'].float(),
                         'pca_proj': data['pca_proj'].float(),
-                        'fft_mag': data['fft_mag'].float(),
                     }
                 else:
                     sum_stats[key]['res_norm'] += data['res_norm'].float()
-                    sum_stats[key]['pca_proj'] += data['pca_proj'].float()
-                    sum_stats[key]['fft_mag'] += data['fft_mag'].float()
+                    # pca_proj 不累加: 不同样本的 PCA 主成分方向不同，跨样本平均投影值无物理意义
+                    # 保留第一个样本的 pca_proj
         count += 1
 
     if count > 1:
+        print(f"WARNING: PCA projections are from the first sample only "
+              f"(cross-sample PCA averaging is mathematically invalid).")
+        print(f"         For PCA visualization, use --sample_id to specify a single sample.")
         for key in sum_stats:
-            for field in sum_stats[key]:
-                sum_stats[key][field] /= count
+            sum_stats[key]['res_norm'] /= count
+            # pca_proj 不做平均（保留第一个样本的值）
 
     print(f"Loaded {len(sum_stats)} entries from {count} sample(s)")
     return sum_stats
@@ -236,152 +238,20 @@ def plot_residual_pca(stats, output_dir):
     print(f"Saved: {save_path}")
 
 
-def compute_radial_profile(fft_mag_2d):
-    """
-    将 2D FFT 幅度谱转换为径向频率分布。
-
-    Args:
-        fft_mag_2d: [H, W//2+1] FFT 幅度
-
-    Returns:
-        freqs: 1D 频率轴
-        profile: 每个频率 bin 的平均幅度
-    """
-    H, W_half = fft_mag_2d.shape
-    # 构建频率网格
-    fy = np.fft.fftfreq(H)  # [-0.5, 0.5)
-    fx = np.fft.rfftfreq(W_half * 2 - 1)  # [0, 0.5]
-
-    fy_grid, fx_grid = np.meshgrid(fy, fx, indexing="ij")
-    r = np.sqrt(fy_grid ** 2 + fx_grid ** 2)
-
-    # 将径向距离分 bin
-    max_r = r.max()
-    n_bins = min(H // 2, 30)
-    bin_edges = np.linspace(0, max_r, n_bins + 1)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    profile = np.zeros(n_bins)
-    for i in range(n_bins):
-        mask = (r >= bin_edges[i]) & (r < bin_edges[i + 1])
-        if mask.sum() > 0:
-            profile[i] = fft_mag_2d[mask].mean()
-
-    return bin_centers, profile
-
-
-def plot_fft_radial_curves(stats, output_dir):
-    """
-    图表3a: 径向频率能量分布曲线。
-
-    为每个 step 画一张图，40 条曲线对应 40 个 block，颜色渐变区分。
-    """
-    fig, axes = plt.subplots(1, NUM_STEPS, figsize=(24, 6))
-    cmap = plt.cm.viridis
-
-    for step in range(NUM_STEPS):
-        ax = axes[step]
-        for blk in range(NUM_BLOCKS):
-            key = (step, blk)
-            if key not in stats:
-                continue
-            fft_mag = stats[key]['fft_mag'].numpy()
-            freqs, profile = compute_radial_profile(fft_mag)
-            color = cmap(blk / (NUM_BLOCKS - 1))
-            ax.plot(freqs, profile, color=color, alpha=0.7, linewidth=0.8)
-
-        ax.set_xlabel("Spatial Frequency", fontsize=10)
-        ax.set_ylabel("Mean Amplitude", fontsize=10)
-        ax.set_title(f"Step {step}", fontsize=12, fontweight="bold")
-        ax.set_yscale("log")
-        ax.grid(True, alpha=0.3)
-
-    # 添加一个 colorbar 表示 block 索引
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=NUM_BLOCKS - 1))
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.015, pad=0.02)
-    cbar.set_label("Block Index", fontsize=11)
-
-    fig.suptitle("Radial FFT Profile of Residual Energy\n"
-                 "Low freq = structure/layout, High freq = texture/detail",
-                 fontsize=13, y=1.02)
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, "block_fft_radial_curves.png")
-    fig.savefig(save_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {save_path}")
-
-
-def plot_fft_band_heatmap(stats, output_dir):
-    """
-    图表3b: low/mid/high 频段能量比例热力图。
-
-    40(blocks) × 4(steps) 的 3 通道堆叠图。
-    """
-    # 计算每个 (step, block) 的三个频段能量比例
-    band_ratios = np.zeros((NUM_BLOCKS, NUM_STEPS, 3))  # [blocks, steps, (low/mid/high)]
-
-    for step in range(NUM_STEPS):
-        for blk in range(NUM_BLOCKS):
-            key = (step, blk)
-            if key not in stats:
-                continue
-            fft_mag = stats[key]['fft_mag'].numpy()
-            freqs, profile = compute_radial_profile(fft_mag)
-
-            # 将频率分为三个频段
-            n = len(freqs)
-            low_end = n // 3
-            mid_end = 2 * n // 3
-
-            energy_low = profile[:low_end].sum()
-            energy_mid = profile[low_end:mid_end].sum()
-            energy_high = profile[mid_end:].sum()
-            total = energy_low + energy_mid + energy_high + 1e-12
-
-            band_ratios[blk, step, 0] = energy_low / total
-            band_ratios[blk, step, 1] = energy_mid / total
-            band_ratios[blk, step, 2] = energy_high / total
-
-    band_names = ["Low Freq\n(Structure)", "Mid Freq\n(Contour)", "High Freq\n(Detail)"]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 10))
-
-    for band_idx in range(3):
-        ax = axes[band_idx]
-        data = band_ratios[:, :, band_idx]  # [40, 4]
-        im = ax.imshow(data, cmap="YlOrRd", aspect="auto", interpolation="nearest",
-                        vmin=0, vmax=1)
-        ax.set_xlabel("Step", fontsize=11)
-        ax.set_ylabel("Block Index", fontsize=11)
-        ax.set_title(band_names[band_idx], fontsize=12, fontweight="bold")
-        ax.set_xticks(range(NUM_STEPS))
-        ax.set_xticklabels([f"Step {s}" for s in range(NUM_STEPS)], fontsize=9)
-        ax.set_yticks(range(0, NUM_BLOCKS, 5))
-        ax.set_yticklabels(range(0, NUM_BLOCKS, 5), fontsize=9)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    fig.suptitle("Frequency Band Energy Ratios per Block per Step\n"
-                 "Each cell shows the proportion of energy in that frequency band",
-                 fontsize=13, y=1.02)
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, "block_fft_band_heatmap.png")
-    fig.savefig(save_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {save_path}")
-
-
 def plot_block_role_summary(stats, output_dir):
     """
-    附加图表: Block 角色分类汇总。
+    附加图表: Block 空间集中度分析。
 
-    基于残差能量的空间分布和频率特征，为每个 block 生成一个角色标签。
+    基于残差能量的空间分布（基尼系数），为每个 block 生成空间集中度标签。
+    基尼系数: Gini = 1 − 2·L + 1/n，其中 L = ∑cumsum(sorted_x) / (n · total)
+    Gini 接近 1 表示能量集中在少数像素，接近 0 表示均匀分布。
     """
     import json
 
     sample_key = next(iter(stats))
     T, H, W = stats[sample_key]['res_norm'].shape
 
-    roles = {}  # {(step, block): {"dominant_freq": str, "spatial_focus": str, "energy": float}}
+    roles = {}
 
     for step in range(NUM_STEPS):
         for blk in range(NUM_BLOCKS):
@@ -390,33 +260,14 @@ def plot_block_role_summary(stats, output_dir):
                 continue
 
             res_norm = stats[key]['res_norm']  # [T, H, W]
-            fft_mag = stats[key]['fft_mag'].numpy()
 
-            # 频域分析
-            freqs, profile = compute_radial_profile(fft_mag)
-            n = len(freqs)
-            low_end = n // 3
-            mid_end = 2 * n // 3
-            energy_low = profile[:low_end].sum()
-            energy_mid = profile[low_end:mid_end].sum()
-            energy_high = profile[mid_end:].sum()
-            total_freq = energy_low + energy_mid + energy_high + 1e-12
-
-            if energy_low / total_freq > 0.55:
-                dom_freq = "low_freq_structure"
-            elif energy_high / total_freq > 0.35:
-                dom_freq = "high_freq_detail"
-            else:
-                dom_freq = "mid_freq_contour"
-
-            # 空间集中度分析（使用基尼系数的简化版本）
+            # 空间集中度分析（基尼系数）
             flat = res_norm.flatten().numpy()
             total_energy = float(flat.sum())
             sorted_flat = np.sort(flat)
             cumsum = np.cumsum(sorted_flat)
             n_pixels = len(flat)
             if total_energy > 1e-8:
-                # 计算洛伦兹曲线下面积
                 lorenz_area = cumsum.sum() / (n_pixels * total_energy)
                 gini = 1 - 2 * lorenz_area + 1 / n_pixels
             else:
@@ -430,13 +281,9 @@ def plot_block_role_summary(stats, output_dir):
                 spatial_focus = "globally_distributed"
 
             roles[f"step{step}_block{blk}"] = {
-                "dominant_frequency": dom_freq,
                 "spatial_focus": spatial_focus,
                 "total_energy": float(total_energy),
                 "gini_coefficient": float(gini),
-                "freq_low_ratio": float(energy_low / total_freq),
-                "freq_mid_ratio": float(energy_mid / total_freq),
-                "freq_high_ratio": float(energy_high / total_freq),
             }
 
     save_path = os.path.join(output_dir, "block_role_classification.json")
@@ -444,31 +291,11 @@ def plot_block_role_summary(stats, output_dir):
         json.dump(roles, f, indent=2)
     print(f"Saved: {save_path}")
 
-    # 可视化角色矩阵
-    freq_map = {"low_freq_structure": 0, "mid_freq_contour": 1, "high_freq_detail": 2}
+    # 可视化空间集中度矩阵
     spatial_map = {"globally_distributed": 0, "moderately_localized": 1, "highly_localized": 2}
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 10))
+    fig, ax = plt.subplots(figsize=(8, 10))
 
-    # 频率角色矩阵
-    freq_matrix = np.zeros((NUM_BLOCKS, NUM_STEPS))
-    for step in range(NUM_STEPS):
-        for blk in range(NUM_BLOCKS):
-            role = roles.get(f"step{step}_block{blk}", {})
-            freq_matrix[blk, step] = freq_map.get(role.get("dominant_frequency", ""), 1)
-
-    freq_cmap = mcolors.ListedColormap(["#2196F3", "#FF9800", "#E91E63"])
-    im1 = ax1.imshow(freq_matrix, cmap=freq_cmap, aspect="auto", interpolation="nearest",
-                     vmin=-0.5, vmax=2.5)
-    ax1.set_xlabel("Step", fontsize=11)
-    ax1.set_ylabel("Block Index", fontsize=11)
-    ax1.set_title("Dominant Frequency Band", fontsize=12, fontweight="bold")
-    ax1.set_xticks(range(NUM_STEPS))
-    ax1.set_yticks(range(0, NUM_BLOCKS, 5))
-    cbar1 = fig.colorbar(im1, ax=ax1, ticks=[0, 1, 2])
-    cbar1.set_ticklabels(["Low\n(Structure)", "Mid\n(Contour)", "High\n(Detail)"])
-
-    # 空间集中度矩阵
     spatial_matrix = np.zeros((NUM_BLOCKS, NUM_STEPS))
     for step in range(NUM_STEPS):
         for blk in range(NUM_BLOCKS):
@@ -476,18 +303,19 @@ def plot_block_role_summary(stats, output_dir):
             spatial_matrix[blk, step] = spatial_map.get(role.get("spatial_focus", ""), 0)
 
     spatial_cmap = mcolors.ListedColormap(["#4CAF50", "#FFC107", "#F44336"])
-    im2 = ax2.imshow(spatial_matrix, cmap=spatial_cmap, aspect="auto", interpolation="nearest",
-                     vmin=-0.5, vmax=2.5)
-    ax2.set_xlabel("Step", fontsize=11)
-    ax2.set_ylabel("Block Index", fontsize=11)
-    ax2.set_title("Spatial Focus Pattern", fontsize=12, fontweight="bold")
-    ax2.set_xticks(range(NUM_STEPS))
-    ax2.set_yticks(range(0, NUM_BLOCKS, 5))
-    cbar2 = fig.colorbar(im2, ax=ax2, ticks=[0, 1, 2])
-    cbar2.set_ticklabels(["Global", "Moderate", "Localized"])
+    im = ax.imshow(spatial_matrix, cmap=spatial_cmap, aspect="auto", interpolation="nearest",
+                   vmin=-0.5, vmax=2.5)
+    ax.set_xlabel("Step", fontsize=11)
+    ax.set_ylabel("Block Index", fontsize=11)
+    ax.set_title("Spatial Focus Pattern (Gini Coefficient)", fontsize=12, fontweight="bold")
+    ax.set_xticks(range(NUM_STEPS))
+    ax.set_xticklabels([f"Step {s}" for s in range(NUM_STEPS)])
+    ax.set_yticks(range(0, NUM_BLOCKS, 5))
+    cbar = fig.colorbar(im, ax=ax, ticks=[0, 1, 2])
+    cbar.set_ticklabels(["Global", "Moderate", "Localized"])
 
-    fig.suptitle("Block Role Classification\n"
-                 "Left: What frequency the block operates on | Right: Where it focuses spatially",
+    fig.suptitle("Block Spatial Concentration Analysis\n"
+                 "Localized = energy concentrated in few pixels (Gini > 0.6)",
                  fontsize=13, y=1.02)
     plt.tight_layout()
     save_path = os.path.join(output_dir, "block_role_matrix.png")
@@ -517,12 +345,6 @@ def main():
 
     print("\n=== Generating PCA RGB Maps ===")
     plot_residual_pca(stats, args.output_dir)
-
-    print("\n=== Generating FFT Radial Curves ===")
-    plot_fft_radial_curves(stats, args.output_dir)
-
-    print("\n=== Generating FFT Band Heatmap ===")
-    plot_fft_band_heatmap(stats, args.output_dir)
 
     print("\n=== Generating Block Role Summary ===")
     plot_block_role_summary(stats, args.output_dir)

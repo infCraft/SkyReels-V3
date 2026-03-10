@@ -2,11 +2,15 @@
 """
 CKA 热力图可视化脚本
 
-读取 cka_extract.py 产出的 CKA 矩阵数据，生成以下图表：
+读取 cka_extract.py 产出的 CKA 矩阵和残差余弦相似度矩阵数据，生成以下图表：
 1. 全局 160×160 CKA 热力图（跨 step + block）
 2. 深度感知 CKA 热力图阵列（4 张 40×40，每个 step 一张）
 3. 时序演进 CKA 热力图（40 张 4×4，每个 block 一张，排列为 8×5 网格）
 4. 相邻 block 对角 CKA 曲线
+5. 全局 160×160 残差余弦相似度热力图
+6. 深度感知余弦相似度热力图阵列
+7. 相邻 block 余弦相似度对角曲线
+8. 相对残差幅度 40×4 热力图
 
 用法:
     python scripts/cka_visualize.py \
@@ -325,6 +329,212 @@ def generate_summary_stats(cka, output_dir, redundancy_threshold=0.95):
     print(f"Saved: {save_path}")
 
 
+# ============================================================
+# 残差余弦相似度可视化
+# ============================================================
+
+def load_residual_cosine_matrix(input_dir):
+    """加载平均残差余弦相似度矩阵。如果不存在，尝试从 per-sample 矩阵计算。"""
+    avg_path = os.path.join(input_dir, "residual_cosine_average.npy")
+    if os.path.exists(avg_path):
+        cosine = np.load(avg_path)
+        print(f"Loaded average residual cosine matrix from {avg_path}, shape={cosine.shape}")
+        return cosine
+
+    sample_files = sorted([f for f in os.listdir(input_dir) if f.endswith("_residual_cosine.npy")])
+    if not sample_files:
+        return None
+
+    matrices = [np.load(os.path.join(input_dir, f)) for f in sample_files]
+    cosine = np.mean(matrices, axis=0)
+    print(f"Computed average residual cosine from {len(matrices)} samples")
+    return cosine
+
+
+def load_relative_magnitude(input_dir):
+    """加载平均相对残差幅度矩阵 [NUM_BLOCKS, NUM_STEPS]。"""
+    avg_path = os.path.join(input_dir, "relative_magnitude_average.npy")
+    if os.path.exists(avg_path):
+        rel_mag = np.load(avg_path)
+        print(f"Loaded average relative magnitude from {avg_path}, shape={rel_mag.shape}")
+        return rel_mag
+
+    sample_files = sorted([f for f in os.listdir(input_dir) if f.endswith("_relative_magnitude.npy")])
+    if not sample_files:
+        return None
+
+    matrices = [np.load(os.path.join(input_dir, f)) for f in sample_files]
+    rel_mag = np.mean(matrices, axis=0)
+    print(f"Computed average relative magnitude from {len(matrices)} samples")
+    return rel_mag
+
+
+def plot_cosine_global_heatmap(cosine, output_dir):
+    """
+    全局 160×160 残差余弦相似度热力图。
+
+    CosSim(i, j) = (r̄_i · r̄_j) / (‖r̄_i‖ · ‖r̄_j‖)
+    其中 r̄_i 是 block i 的残差沿 token 维度的均值。
+    值域 [-1, 1]，用发散色图（RdBu_r）中心在 0。
+    """
+    fig, ax = plt.subplots(figsize=(16, 14))
+
+    im = ax.imshow(cosine, cmap="RdBu_r", vmin=-1.0, vmax=1.0, interpolation="nearest")
+
+    for s in range(1, NUM_STEPS):
+        boundary = s * NUM_BLOCKS - 0.5
+        ax.axhline(y=boundary, color="black", linewidth=1.5, linestyle="--", alpha=0.8)
+        ax.axvline(x=boundary, color="black", linewidth=1.5, linestyle="--", alpha=0.8)
+
+    for s in range(NUM_STEPS):
+        center = s * NUM_BLOCKS + NUM_BLOCKS / 2
+        ax.text(center, -3, f"Step {s}", ha="center", va="bottom", fontsize=11,
+                fontweight="bold", color="black")
+        ax.text(-3, center, f"Step {s}", ha="right", va="center", fontsize=11,
+                fontweight="bold", color="black", rotation=90)
+
+    tick_positions = []
+    tick_labels = []
+    for s in range(NUM_STEPS):
+        for b in range(0, NUM_BLOCKS, 10):
+            tick_positions.append(s * NUM_BLOCKS + b)
+            tick_labels.append(f"{b}")
+
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, fontsize=8)
+    ax.set_yticks(tick_positions)
+    ax.set_yticklabels(tick_labels, fontsize=8)
+
+    ax.set_xlabel("Block Index (within each Step)", fontsize=12)
+    ax.set_ylabel("Block Index (within each Step)", fontsize=12)
+    ax.set_title("Residual Cosine Similarity Matrix (4 Steps × 40 Blocks = 160)\n"
+                 "CosSim(i,j) = r̄_i·r̄_j / (‖r̄_i‖·‖r̄_j‖), r̄ = mean-pooled residual",
+                 fontsize=13)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Cosine Similarity", fontsize=11)
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "cosine_global_160x160.png")
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {save_path}")
+
+
+def plot_cosine_depthwise_heatmaps(cosine, output_dir):
+    """深度感知余弦相似度热力图阵列（4 张 40×40）。"""
+    fig, axes = plt.subplots(1, NUM_STEPS, figsize=(24, 6))
+
+    for s in range(NUM_STEPS):
+        ax = axes[s]
+        start = s * NUM_BLOCKS
+        end = start + NUM_BLOCKS
+        sub = cosine[start:end, start:end]
+
+        im = ax.imshow(sub, cmap="RdBu_r", vmin=-1.0, vmax=1.0, interpolation="nearest")
+
+        ax.set_title(f"Step {s}", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Block Index", fontsize=10)
+        if s == 0:
+            ax.set_ylabel("Block Index", fontsize=10)
+
+        ticks = list(range(0, NUM_BLOCKS, 5))
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(ticks, fontsize=8)
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(ticks, fontsize=8)
+
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02)
+    cbar.set_label("Cosine Similarity", fontsize=11)
+
+    fig.suptitle("Depth-wise Residual Cosine Similarity (Intra-Step)", fontsize=14, y=1.02)
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "cosine_depthwise_40x40.png")
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {save_path}")
+
+
+def plot_cosine_diagonal(cosine, output_dir):
+    """
+    相邻 block 残差余弦相似度对角曲线。
+
+    CosSim(Block_i, Block_{i+1})：高值表示相邻 block 在"同方向"修改表征。
+    """
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    colors = plt.cm.Set1(np.linspace(0, 1, NUM_STEPS))
+
+    for s in range(NUM_STEPS):
+        diag_cos = []
+        for b in range(NUM_BLOCKS - 1):
+            val = cosine[idx(s, b), idx(s, b + 1)]
+            diag_cos.append(val)
+        ax.plot(range(NUM_BLOCKS - 1), diag_cos, marker="o", markersize=3,
+                linewidth=1.5, color=colors[s], label=f"Step {s}", alpha=0.85)
+
+    ax.set_xlabel("Block Index i → i+1", fontsize=12)
+    ax.set_ylabel("CosSim(Block_i, Block_{i+1})", fontsize=12)
+    ax.set_title("Adjacent Block Residual Cosine Similarity\n"
+                 "High values = blocks modify representation in the same direction",
+                 fontsize=13)
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, NUM_BLOCKS - 2)
+    ax.set_ylim(-1.05, 1.05)
+    ax.axhline(y=0, color="gray", linewidth=0.8, linestyle="-", alpha=0.5)
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "cosine_diagonal_adjacent.png")
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {save_path}")
+
+
+def plot_relative_magnitude_heatmap(rel_mag, output_dir):
+    """
+    相对残差幅度 40×4 热力图。
+
+    RelMag_{s,b} = mean_k(‖r_k‖₂) / mean_k(‖x_in_k‖₂)
+    其中 r_k = x_out_k − x_in_k，k 遍历所有有效空间 token。
+
+    值越小表示该 block 对表征的改变越小（跟跳候选）。
+
+    Args:
+        rel_mag: [NUM_BLOCKS, NUM_STEPS] numpy array
+    """
+    fig, ax = plt.subplots(figsize=(8, 12))
+
+    im = ax.imshow(rel_mag, cmap="YlOrRd", aspect="auto", interpolation="nearest")
+
+    ax.set_xlabel("Step", fontsize=12)
+    ax.set_ylabel("Block Index", fontsize=12)
+    ax.set_title("Relative Residual Magnitude per Block per Step\n"
+                 r"RelMag = mean($\|r_k\|$) / mean($\|x_{in,k}\|$)",
+                 fontsize=13)
+    ax.set_xticks(range(NUM_STEPS))
+    ax.set_xticklabels([f"Step {s}" for s in range(NUM_STEPS)], fontsize=10)
+    ax.set_yticks(range(0, NUM_BLOCKS, 5))
+    ax.set_yticklabels(range(0, NUM_BLOCKS, 5), fontsize=9)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Relative Magnitude", fontsize=11)
+
+    # 标注数值（如果 block 数不太多的话）
+    for blk in range(NUM_BLOCKS):
+        for step in range(NUM_STEPS):
+            val = rel_mag[blk, step]
+            color = "white" if val > (rel_mag.max() * 0.6) else "black"
+            ax.text(step, blk, f"{val:.3f}", ha="center", va="center",
+                    fontsize=5, color=color)
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "relative_magnitude_heatmap.png")
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {save_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="CKA Visualization")
     parser.add_argument("--input_dir", type=str, required=True,
@@ -351,6 +561,27 @@ def main():
     plot_diagonal_cka(cka, args.output_dir, redundancy_threshold=args.redundancy_threshold)
     plot_cross_step_diagonal(cka, args.output_dir)
     generate_summary_stats(cka, args.output_dir, redundancy_threshold=args.redundancy_threshold)
+
+    # 残差余弦相似度可视化
+    cosine = load_residual_cosine_matrix(args.input_dir)
+    if cosine is not None:
+        assert cosine.shape == (TOTAL, TOTAL), f"Cosine matrix shape mismatch: {cosine.shape}"
+        print(f"\nCosine diagonal: min={np.diag(cosine).min():.4f}, "
+              f"max={np.diag(cosine).max():.4f}, mean={np.diag(cosine).mean():.4f}")
+        plot_cosine_global_heatmap(cosine, args.output_dir)
+        plot_cosine_depthwise_heatmaps(cosine, args.output_dir)
+        plot_cosine_diagonal(cosine, args.output_dir)
+    else:
+        print("\nNo residual cosine matrix found, skipping cosine plots.")
+
+    # 相对残差幅度可视化
+    rel_mag = load_relative_magnitude(args.input_dir)
+    if rel_mag is not None:
+        print(f"\nRelative magnitude: min={rel_mag.min():.4f}, "
+              f"max={rel_mag.max():.4f}, mean={rel_mag.mean():.4f}")
+        plot_relative_magnitude_heatmap(rel_mag, args.output_dir)
+    else:
+        print("\nNo relative magnitude data found, skipping magnitude plot.")
 
     print(f"\nAll visualizations saved to {args.output_dir}")
 

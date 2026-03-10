@@ -27,6 +27,7 @@ import time
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -112,6 +113,39 @@ def compute_linear_cka_matrix(activations_list, device="cuda"):
     return cka_matrix.cpu().numpy()
 
 
+def compute_cosine_similarity_matrix(residuals_list):
+    """
+    计算 160 个残差张量之间的余弦相似度矩阵（方案 A：mean-pool → cosine）。
+
+    对每个残差 R_i ∈ R^{n×D}，先沿 token 维度取均值得到 r̄_i ∈ R^D
+    （表示该 block 的"平均修改方向"），然后计算两两余弦相似度:
+
+        CosSim(i, j) = (r̄_i · r̄_j) / (‖r̄_i‖ · ‖r̄_j‖)
+
+    值域 [-1, 1]。高值表示两个 block 在同方向修改表征。
+
+    Args:
+        residuals_list: list of [n_tokens, dim] tensors (CPU, float32)
+
+    Returns:
+        cosine_matrix: [160, 160] numpy array, float64
+    """
+    n = len(residuals_list)
+    logging.info(f"Computing cosine similarity matrix for {n} residuals...")
+
+    # Step 1: 沿 token 维度取均值  r̄_i = (1/n) Σ_k R_i[k, :]
+    mean_residuals = torch.stack([r.mean(dim=0) for r in residuals_list])  # [160, D]
+
+    # Step 2: 行归一化  r̂_i = r̄_i / ‖r̄_i‖
+    norms = mean_residuals.norm(dim=1, keepdim=True).clamp(min=1e-12)  # [160, 1]
+    normalized = mean_residuals / norms  # [160, D]
+
+    # Step 3: 余弦矩阵 C = r̂ @ r̂^T，即 C[i,j] = r̂_i · r̂_j
+    cosine_matrix = (normalized @ normalized.T).numpy().astype(np.float64)  # [160, 160]
+
+    return cosine_matrix
+
+
 # ============================================================
 # 激活 Hook 管理器
 # ============================================================
@@ -135,6 +169,8 @@ class ActivationCollector:
 
         # 存储：key = (step, block_idx)
         self.subsampled_activations = {}  # {(step, blk): [n_tokens, dim] CPU float32}
+        self.subsampled_residuals = {}   # {(step, blk): [n_tokens, dim] CPU float32}
+        self.relative_magnitude = {}     # {(step, blk): float, mean(‖r‖)/mean(‖x_in‖)}
         self.spatial_stats = {}          # {(step, blk): dict of stats}
 
         # 子采样索引（在第一次 forward 时根据实际 seq_len 计算）
@@ -166,6 +202,8 @@ class ActivationCollector:
     def clear(self):
         """清除所有已收集的数据。"""
         self.subsampled_activations.clear()
+        self.subsampled_residuals.clear()
+        self.relative_magnitude.clear()
         self.spatial_stats.clear()
         self._subsample_indices = None
         self._seq_len = None
@@ -223,79 +261,95 @@ class ActivationCollector:
             sub_act = x_out_valid[sub_idx].cpu().float()  # [n_sub, D]
             collector.subsampled_activations[(step, blk_idx)] = sub_act
 
-            # 2. 空间统计
+            # 2. 残差计算
             residual = (x_out_valid - x_in_valid).float()  # [seq_len, D]
 
-            n_spatial = T * H * W  # 有效空间 token 数（应 <= seq_len）
+            # 2a. 子采样残差 (余弦相似度矩阵用)
+            sub_res = residual[sub_idx].cpu().float()  # [n_sub, D]
+            collector.subsampled_residuals[(step, blk_idx)] = sub_res
+
+            # 2b. 相对残差幅度 (per-block 标量)
+            # RelMag_{s,b} = mean_k(‖r_k‖₂) / mean_k(‖x_in_k‖₂)
+            # 其中 r_k = x_out_k − x_in_k，k 遍历所有有效空间 token
+            n_spatial = T * H * W
+            with torch.no_grad():
+                res_norms = residual[:n_spatial].norm(dim=-1)  # [n_spatial]
+                xin_norms = x_in_valid[:n_spatial].float().norm(dim=-1)  # [n_spatial]
+                rel_mag = res_norms.mean().item() / (xin_norms.mean().item() + 1e-12)
+            collector.relative_magnitude[(step, blk_idx)] = rel_mag
+
+            # 3. 空间统计
             stats = {}
 
-            # 2a. 残差 L2 范数 → reshape to (T, H, W)
-            res_norm = residual[:n_spatial].norm(dim=-1)  # [n_spatial]
-            res_norm_spatial = res_norm.reshape(T, H, W)
+            # 3a. 残差 L2 范数 → reshape to (T, H, W)
+            res_norm_spatial = res_norms.reshape(T, H, W)
             stats['res_norm'] = res_norm_spatial.cpu()
 
-            # 2b. PCA 投影 (top-3 主成分)
+            # 3b. PCA 投影 (top-3 主成分)
+            # PCA: 对子采样残差列中心化 X_c = X − μ，SVD(X_c) = UΣV^T
+            # 投影: proj = (X_full − μ) @ V，其中 V ∈ R^{D×3}
             sub_residual = residual[sub_idx]  # [n_sub, D]
-            sub_res_centered = sub_residual - sub_residual.mean(dim=0, keepdim=True)
+            res_mean = sub_residual.mean(dim=0, keepdim=True)  # [1, D]
+            sub_res_centered = sub_residual - res_mean
             try:
                 _, _, V = torch.pca_lowrank(sub_res_centered, q=3, niter=4)  # V: [D, 3]
-                pca_proj = residual[:n_spatial] @ V  # [n_spatial, 3]
+                pca_proj = (residual[:n_spatial] - res_mean) @ V  # [n_spatial, 3]
                 pca_proj_spatial = pca_proj.reshape(T, H, W, 3).permute(3, 0, 1, 2)  # [3, T, H, W]
                 stats['pca_proj'] = pca_proj_spatial.cpu()
             except Exception as e:
                 logging.warning(f"PCA failed for step={step}, block={blk_idx}: {e}")
                 stats['pca_proj'] = torch.zeros(3, T, H, W)
 
-            # 2c. FFT 频谱 (每帧的 2D FFT 幅度，帧间平均)
-            fft_mag_frames = []
-            for t_idx in range(T):
-                frame = res_norm_spatial[t_idx]  # [H, W]
-                fft_2d = torch.fft.rfft2(frame)
-                mag = torch.abs(fft_2d)  # [H, W//2+1]
-                fft_mag_frames.append(mag)
-            fft_mag_avg = torch.stack(fft_mag_frames).mean(dim=0)  # [H, W//2+1]
-            stats['fft_mag'] = fft_mag_avg.cpu()
-
             collector.spatial_stats[(step, blk_idx)] = stats
 
             # 释放 GPU 上的中间张量
-            del residual, res_norm, sub_residual, sub_res_centered
+            del residual, res_norms, xin_norms, sub_residual, sub_res_centered, res_mean
             del x_in_valid, x_out_valid
 
         return hook_fn
 
 
 # ============================================================
-# 主流程
+# 主流程 — 多 GPU 数据并行
 # ============================================================
 
-def run_extraction(args):
-    """执行CKA激活提取的主函数。"""
+def worker_fn(rank, num_gpus, args):
+    """
+    单 GPU worker：加载模型到 GPU `rank`，处理分配到的样本，保存 per-sample 结果到磁盘。
 
-    # 加载 manifest
+    样本分配采用交错策略: manifest[rank::num_gpus]，保证各 GPU 负载均衡。
+    """
+    torch.cuda.set_device(rank)
+    device = f"cuda:{rank}"
+
+    # 加载 manifest 并分配样本
     with open(args.manifest_json, "r") as f:
-        manifest_items = json.load(f)
-    logging.info(f"Loaded manifest with {len(manifest_items)} samples")
+        all_items = json.load(f)
+    my_indices = list(range(rank, len(all_items), num_gpus))
+    my_items = [all_items[i] for i in my_indices]
 
-    # 创建输出目录
+    if not my_items:
+        logging.info(f"[GPU {rank}] No samples assigned, exiting")
+        return
+
+    logging.info(f"[GPU {rank}] Assigned {len(my_items)}/{len(all_items)} samples (indices: {my_indices})")
+
     cka_dir = os.path.join(args.output_dir, "cka_matrices")
     spatial_dir = os.path.join(args.output_dir, "spatial_stats")
-    os.makedirs(cka_dir, exist_ok=True)
-    os.makedirs(spatial_dir, exist_ok=True)
 
-    # 初始化 Pipeline
+    # 初始化 Pipeline（每个 worker 独立加载模型到自己的 GPU）
     config = WAN_CONFIGS["talking-avatar-19B"]
-    logging.info("Initializing TalkingAvatarPipeline...")
+    logging.info(f"[GPU {rank}] Initializing TalkingAvatarPipeline on {device}...")
     pipe = TalkingAvatarPipeline(
         config=config,
         model_path=args.model_id,
-        device_id=0,
+        device_id=rank,
         rank=0,
         use_usp=False,
         offload=False,
         low_vram=False,
     )
-    logging.info("Pipeline initialized successfully")
+    logging.info(f"[GPU {rank}] Pipeline initialized")
 
     # 创建 ActivationCollector
     collector = ActivationCollector(
@@ -303,20 +357,17 @@ def run_extraction(args):
         num_subsample_tokens=args.num_subsample_tokens,
         seed=args.seed,
     )
-
-    # 注册 hooks
     collector.register_hooks()
 
-    # 用于累加跨样本平均的 CKA 矩阵
-    cka_sum = None
-    n_samples_processed = 0
+    # 每个 worker 使用独立的音频预处理目录，避免文件冲突
+    audio_dir = os.path.join("processed_audio", f"gpu_{rank}")
 
     # 逐样本处理
-    for item_idx, item in enumerate(manifest_items):
-        sample_id = item.get("id", f"sample_{item_idx:04d}")
-        logging.info(f"{'='*60}")
-        logging.info(f"[{item_idx + 1}/{len(manifest_items)}] Processing sample: {sample_id}")
-        logging.info(f"{'='*60}")
+    for local_idx, (orig_idx, item) in enumerate(zip(my_indices, my_items)):
+        sample_id = item.get("id", f"sample_{orig_idx:04d}")
+        logging.info(f"[GPU {rank}] {'='*50}")
+        logging.info(f"[GPU {rank}] [{local_idx + 1}/{len(my_items)}] Processing: {sample_id}")
+        logging.info(f"[GPU {rank}] {'='*50}")
 
         # 准备输入数据
         input_data = {
@@ -326,16 +377,13 @@ def run_extraction(args):
         }
 
         # 音频预处理
-        logging.info(f"Preprocessing audio for {sample_id}...")
-        input_data, _ = preprocess_audio(args.model_id, input_data, "processed_audio")
+        logging.info(f"[GPU {rank}] Preprocessing audio for {sample_id}...")
+        input_data, _ = preprocess_audio(args.model_id, input_data, audio_dir)
 
         # 清理 collector 状态
         collector.clear()
 
-        # Monkey-patch model.forward 以跟踪步骤编号。
-        # pipeline 的去噪循环（包括多 segment 情况）中，每次调用 model.forward() 就是一个 step。
-        # 我们只记录前 NUM_STEPS 个调用（即第一个 segment 的所有 step），
-        # 后续 segment 的调用通过 set_step(-1) 禁用 hook 收集。
+        # Monkey-patch model.forward 以跟踪步骤编号
         original_model_forward = pipe.model.forward
         step_counter = [0]
 
@@ -344,16 +392,16 @@ def run_extraction(args):
             if current_step < NUM_STEPS:
                 collector.set_step(current_step)
             else:
-                collector.set_step(-1)  # 禁用收集
+                collector.set_step(-1)
             result = original_model_forward(*args_f, **kwargs_f)
             step_counter[0] += 1
             return result
 
         pipe.model.forward = counting_forward
 
-        # 执行推理（让 pipeline 自然运行，我们只采集第一个 segment 的数据）
+        # 执行推理
         try:
-            logging.info(f"Running inference for {sample_id}...")
+            logging.info(f"[GPU {rank}] Running inference for {sample_id}...")
             step_counter[0] = 0
 
             kwargs = {
@@ -371,18 +419,17 @@ def run_extraction(args):
             }
             _ = pipe.generate(**kwargs)
 
-            logging.info(f"Inference complete. Total model.forward calls: {step_counter[0]}. "
+            logging.info(f"[GPU {rank}] Inference complete. Total model.forward calls: {step_counter[0]}. "
                          f"Collected {len(collector.subsampled_activations)} activations")
 
         finally:
-            # 恢复原始 forward
             pipe.model.forward = original_model_forward
 
         # 验证收集的激活数量
         expected = TOTAL_ACTIVATIONS
         actual = len(collector.subsampled_activations)
         if actual != expected:
-            logging.warning(f"Expected {expected} activations, got {actual}. Skipping CKA for this sample.")
+            logging.warning(f"[GPU {rank}] Expected {expected} activations, got {actual}. Skipping this sample.")
             continue
 
         # 保存空间统计数据
@@ -391,7 +438,7 @@ def run_extraction(args):
         for (step, blk_idx), stats in collector.spatial_stats.items():
             save_path = os.path.join(sample_spatial_dir, f"step{step}_block{blk_idx}.pt")
             torch.save(stats, save_path)
-        logging.info(f"Saved spatial stats to {sample_spatial_dir}")
+        logging.info(f"[GPU {rank}] Saved spatial stats to {sample_spatial_dir}")
 
         # 构建激活列表（按 step 和 block 排序）
         activation_list = []
@@ -399,63 +446,167 @@ def run_extraction(args):
             for blk in range(NUM_BLOCKS):
                 activation_list.append(collector.subsampled_activations[(step, blk)])
 
-        # 将模型移到CPU以释放显存
-        logging.info("Offloading model to CPU for CKA computation...")
+        # 将模型移到 CPU 以释放显存给 CKA 计算
+        logging.info(f"[GPU {rank}] Offloading model to CPU for CKA computation...")
         pipe.model.to("cpu")
         pipe.vae.to("cpu")
         torch.cuda.empty_cache()
         gc.collect()
 
         # 在 GPU 上计算 CKA 矩阵
-        logging.info(f"Computing CKA matrix ({TOTAL_ACTIVATIONS}x{TOTAL_ACTIVATIONS})...")
+        logging.info(f"[GPU {rank}] Computing CKA matrix ({TOTAL_ACTIVATIONS}x{TOTAL_ACTIVATIONS})...")
         t_start = time.time()
-        cka_matrix = compute_linear_cka_matrix(activation_list, device="cuda")
+        cka_matrix = compute_linear_cka_matrix(activation_list, device=device)
         t_elapsed = time.time() - t_start
-        logging.info(f"CKA computation took {t_elapsed:.1f}s")
+        logging.info(f"[GPU {rank}] CKA computation took {t_elapsed:.1f}s")
 
         # 保存 per-sample CKA 矩阵
         cka_path = os.path.join(cka_dir, f"{sample_id}_cka.npy")
         np.save(cka_path, cka_matrix)
-        logging.info(f"Saved CKA matrix to {cka_path}")
+        logging.info(f"[GPU {rank}] Saved CKA matrix to {cka_path}")
 
-        # 累加到平均
-        if cka_sum is None:
-            cka_sum = cka_matrix.copy()
-        else:
-            cka_sum += cka_matrix
-        n_samples_processed += 1
+        # 构建残差列表并计算余弦相似度矩阵 (CPU 计算)
+        residual_list = []
+        for step in range(NUM_STEPS):
+            for blk in range(NUM_BLOCKS):
+                residual_list.append(collector.subsampled_residuals[(step, blk)])
+        cosine_matrix = compute_cosine_similarity_matrix(residual_list)
+        cosine_path = os.path.join(cka_dir, f"{sample_id}_residual_cosine.npy")
+        np.save(cosine_path, cosine_matrix)
+        logging.info(f"[GPU {rank}] Saved residual cosine matrix to {cosine_path}")
 
-        # 释放激活内存
-        del activation_list, cka_matrix
+        # 保存 per-sample 相对残差幅度 [NUM_BLOCKS, NUM_STEPS]
+        rel_mag_array = np.zeros((NUM_BLOCKS, NUM_STEPS))
+        for (step, blk), val in collector.relative_magnitude.items():
+            rel_mag_array[blk, step] = val
+        rel_mag_path = os.path.join(cka_dir, f"{sample_id}_relative_magnitude.npy")
+        np.save(rel_mag_path, rel_mag_array)
+        logging.info(f"[GPU {rank}] Saved relative magnitude to {rel_mag_path}")
+
+        # 释放内存
+        del activation_list, cka_matrix, residual_list, cosine_matrix, rel_mag_array
         collector.clear()
         gc.collect()
 
         # 将模型移回 GPU
-        logging.info("Moving model back to GPU...")
-        pipe.model.to("cuda")
-        pipe.vae.to("cuda")
+        logging.info(f"[GPU {rank}] Moving model back to {device}...")
+        pipe.model.to(device)
+        pipe.vae.to(device)
         torch.cuda.empty_cache()
-
-    # 计算并保存平均 CKA 矩阵
-    if n_samples_processed > 0:
-        cka_avg = cka_sum / n_samples_processed
-        avg_path = os.path.join(cka_dir, "cka_average.npy")
-        np.save(avg_path, cka_avg)
-        logging.info(f"Saved average CKA matrix ({n_samples_processed} samples) to {avg_path}")
-
-        # 同时保存为 .pt 格式
-        torch.save({
-            "cka_average": torch.from_numpy(cka_avg),
-            "n_samples": n_samples_processed,
-            "num_blocks": NUM_BLOCKS,
-            "num_steps": NUM_STEPS,
-            "num_subsample_tokens": args.num_subsample_tokens,
-        }, os.path.join(cka_dir, "cka_summary.pt"))
-    else:
-        logging.warning("No samples processed successfully!")
 
     # 清理
     collector.remove_hooks()
+    logging.info(f"[GPU {rank}] Worker finished. Processed {len(my_items)} samples.")
+
+
+def aggregate_results(args):
+    """
+    从磁盘加载所有 per-sample 结果，计算跨样本平均值并保存。
+
+    在所有 worker 完成后由主进程调用。
+    """
+    cka_dir = os.path.join(args.output_dir, "cka_matrices")
+
+    # 发现所有 per-sample CKA 文件
+    all_files = os.listdir(cka_dir)
+    cka_files = sorted(f for f in all_files
+                       if f.endswith("_cka.npy") and f != "cka_average.npy")
+
+    if not cka_files:
+        logging.warning("No per-sample CKA files found for aggregation!")
+        return
+
+    n_samples = len(cka_files)
+    logging.info(f"Aggregating results from {n_samples} samples...")
+
+    cka_sum = None
+    cosine_sum = None
+    cosine_count = 0
+    rel_mag_sum = None
+    rel_mag_count = 0
+
+    for cka_file in cka_files:
+        sample_id = cka_file.replace("_cka.npy", "")
+
+        cka_matrix = np.load(os.path.join(cka_dir, cka_file))
+        if cka_sum is None:
+            cka_sum = cka_matrix.copy()
+        else:
+            cka_sum += cka_matrix
+
+        cosine_path = os.path.join(cka_dir, f"{sample_id}_residual_cosine.npy")
+        if os.path.exists(cosine_path):
+            cosine_matrix = np.load(cosine_path)
+            if cosine_sum is None:
+                cosine_sum = cosine_matrix.copy()
+            else:
+                cosine_sum += cosine_matrix
+            cosine_count += 1
+
+        rel_mag_path = os.path.join(cka_dir, f"{sample_id}_relative_magnitude.npy")
+        if os.path.exists(rel_mag_path):
+            rel_mag_array = np.load(rel_mag_path)
+            if rel_mag_sum is None:
+                rel_mag_sum = rel_mag_array.copy()
+            else:
+                rel_mag_sum += rel_mag_array
+            rel_mag_count += 1
+
+    # 保存平均值
+    cka_avg = cka_sum / n_samples
+    np.save(os.path.join(cka_dir, "cka_average.npy"), cka_avg)
+    logging.info(f"Saved average CKA matrix ({n_samples} samples)")
+
+    summary = {
+        "cka_average": torch.from_numpy(cka_avg),
+        "n_samples": n_samples,
+        "num_blocks": NUM_BLOCKS,
+        "num_steps": NUM_STEPS,
+        "num_subsample_tokens": args.num_subsample_tokens,
+    }
+
+    if cosine_sum is not None:
+        cosine_avg = cosine_sum / cosine_count
+        np.save(os.path.join(cka_dir, "residual_cosine_average.npy"), cosine_avg)
+        summary["cosine_average"] = torch.from_numpy(cosine_avg)
+        logging.info(f"Saved average residual cosine matrix ({cosine_count} samples)")
+
+    if rel_mag_sum is not None:
+        rel_mag_avg = rel_mag_sum / rel_mag_count
+        np.save(os.path.join(cka_dir, "relative_magnitude_average.npy"), rel_mag_avg)
+        summary["relative_magnitude_average"] = torch.from_numpy(rel_mag_avg)
+        logging.info(f"Saved average relative magnitude ({rel_mag_count} samples)")
+
+    torch.save(summary, os.path.join(cka_dir, "cka_summary.pt"))
+    logging.info(f"Aggregation complete. Results in {cka_dir}")
+
+
+def run_extraction(args):
+    """主入口：启动 worker 并聚合结果。"""
+
+    # 预创建输出目录
+    cka_dir = os.path.join(args.output_dir, "cka_matrices")
+    spatial_dir = os.path.join(args.output_dir, "spatial_stats")
+    os.makedirs(cka_dir, exist_ok=True)
+    os.makedirs(spatial_dir, exist_ok=True)
+
+    num_gpus = args.num_gpus
+
+    # 检查 GPU 可用性
+    available_gpus = torch.cuda.device_count()
+    if num_gpus > available_gpus:
+        logging.warning(f"Requested {num_gpus} GPUs but only {available_gpus} available. "
+                        f"Using {available_gpus} GPUs.")
+        num_gpus = available_gpus
+
+    if num_gpus > 1:
+        logging.info(f"Launching {num_gpus} workers for data-parallel extraction...")
+        mp.spawn(worker_fn, nprocs=num_gpus, args=(num_gpus, args))
+    else:
+        worker_fn(0, 1, args)
+
+    # 所有 worker 完成后，聚合 per-sample 结果
+    aggregate_results(args)
 
     logging.info("CKA extraction complete!")
 
@@ -472,6 +623,8 @@ if __name__ == "__main__":
                         help="Number of tokens to subsample for CKA computation")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    parser.add_argument("--num_gpus", type=int, default=1,
+                        help="Number of GPUs for data-parallel extraction (default: 1)")
     args = parser.parse_args()
 
     run_extraction(args)
